@@ -5,7 +5,8 @@ const {
   Events,
   GatewayIntentBits,
 } = require("discord.js");
-const { DateTime } = require("luxon");
+
+process.env.TZ = "Europe/Amsterdam";
 
 const CONFIG = Object.freeze({
   attendanceChannelId: "1438602360095113390",
@@ -28,13 +29,19 @@ const client = new Client({
 let dashboardMessages;
 let refreshInProgress = false;
 
-function getWeekPeriod(now = DateTime.now().setZone(CONFIG.timeZone)) {
-  let start = now.startOf("day").minus({ days: now.weekday - 1 });
-  let end = start.plus({ days: 6 }).set({ hour: 20 });
+function getWeekPeriod(now = new Date()) {
+  const current = new Date(now);
+  const start = new Date(current);
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
 
-  if (now >= end) {
-    start = start.plus({ weeks: 1 });
-    end = end.plus({ weeks: 1 });
+  const end = new Date(start);
+  end.setDate(end.getDate() + 6);
+  end.setHours(20, 0, 0, 0);
+
+  if (current >= end) {
+    start.setDate(start.getDate() + 7);
+    end.setDate(end.getDate() + 7);
   }
 
   return {
@@ -87,9 +94,12 @@ function collectAttendance(messages, allowedMemberIds) {
   );
 
   for (const message of messages) {
-    const dateKey = DateTime.fromMillis(message.createdTimestamp, {
-      zone: CONFIG.timeZone,
-    }).toISODate();
+    const messageDate = new Date(message.createdTimestamp);
+    const dateKey = [
+      messageDate.getFullYear(),
+      String(messageDate.getMonth() + 1).padStart(2, "0"),
+      String(messageDate.getDate()).padStart(2, "0"),
+    ].join("-");
 
     for (const memberId of getMentionedUserIds(message.content)) {
       if (attendance.has(memberId)) attendance.get(memberId).add(dateKey);
@@ -102,11 +112,16 @@ function collectAttendance(messages, allowedMemberIds) {
 function formatAttendanceDates(dateKeys) {
   return [...dateKeys]
     .sort()
-    .map((dateKey) =>
-      DateTime.fromISO(dateKey, { zone: CONFIG.timeZone })
-        .setLocale("nl")
-        .toFormat("ccc dd-LL"),
-    )
+    .map((dateKey) => {
+      const [year, month, day] = dateKey.split("-").map(Number);
+
+      return new Intl.DateTimeFormat("nl-NL", {
+        timeZone: CONFIG.timeZone,
+        weekday: "short",
+        day: "2-digit",
+        month: "2-digit",
+      }).format(new Date(year, month - 1, day, 12));
+    })
     .join(", ");
 }
 
@@ -159,8 +174,8 @@ function buildDashboardEmbeds(members, attendance, period, messageCount) {
     (member) => attendance.get(member.id).size > 0,
   ).length;
   const updatedAt = Math.floor(Date.now() / 1_000);
-  const startAt = Math.floor(period.start.toSeconds());
-  const endAt = Math.floor(period.end.toSeconds());
+  const startAt = Math.floor(period.start.getTime() / 1_000);
+  const endAt = Math.floor(period.end.getTime() / 1_000);
   const avatarUrl = client.user.displayAvatarURL({ size: 256 });
 
   return chunks.map((chunk, index) => {
@@ -273,7 +288,7 @@ async function refreshDashboard() {
     const period = getWeekPeriod();
     const messages = await fetchMessagesSince(
       attendanceChannel,
-      period.start.toMillis(),
+      period.start.getTime(),
     );
     const attendance = collectAttendance(messages, new Set(members.keys()));
     const embeds = buildDashboardEmbeds(
