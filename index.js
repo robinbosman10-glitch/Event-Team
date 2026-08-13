@@ -14,6 +14,7 @@ const CONFIG = Object.freeze({
   overviewChannelId: "1537247199606608013",
   inactivityChannelId: "1537255726735691786",
   absenceChannelId: "1509628813628280842",
+  attendanceArchiveChannelId: "1537265369352372346",
   absenceCommandRoleId: "1218521637368893471",
   excludedUserIds: ["683032015045787676"],
   attendanceExemptRoleIds: [
@@ -38,6 +39,8 @@ const CONFIG = Object.freeze({
   inactivityCutoffHour: 21,
   updateIntervalMs: 5 * 60 * 1000,
   attendanceDashboardMarker: "AFR-WEEKOVERZICHT",
+  attendanceArchiveMarker: "AFR-WEEKARCHIEF",
+  attendanceArchiveTestMarker: "AFR-WEEKARCHIEF-TEST",
   inactivityDashboardMarker: "AFR-INACTIVITEIT",
   manualAbsenceMarker: "AFR-HANDMATIG-AFWEZIG",
   removedAbsenceMarker: "AFR-AFWEZIG-VERWIJDERD",
@@ -101,6 +104,7 @@ const client = new Client({
 const dashboardMessagesByMarker = new Map();
 let refreshInProgress = false;
 let dashboardGuildId = null;
+let archiveTestSentThisSession = false;
 
 async function loadAllGuildMembers(guild) {
   let after;
@@ -149,6 +153,19 @@ function getWeekPeriod(now = new Date()) {
   };
 }
 
+function getMostRecentCompletedWeek(now = new Date()) {
+  const activePeriod = getWeekPeriod(now);
+  const start = addLocalDays(activePeriod.start, -7);
+  const end = addLocalDays(start, 6);
+  end.setHours(20, 0, 0, 0);
+
+  return { start, end };
+}
+
+function isWeeklyArchiveTime(now = new Date()) {
+  return now.getDay() === 0 && now.getHours() >= 20;
+}
+
 function getMonthStart(now = new Date()) {
   const start = new Date(now);
   start.setDate(1);
@@ -160,6 +177,14 @@ function addLocalDays(date, days) {
   const result = new Date(date);
   result.setDate(result.getDate() + days);
   return result;
+}
+
+function getLocalDateKey(date) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
 }
 
 function parseDutchDateTime(dateText, timeText, useEndOfDay = false) {
@@ -421,11 +446,7 @@ function collectAttendance(messages, allowedMemberIds) {
 
   for (const message of messages) {
     const messageDate = new Date(message.createdTimestamp);
-    const dateKey = [
-      messageDate.getFullYear(),
-      String(messageDate.getMonth() + 1).padStart(2, "0"),
-      String(messageDate.getDate()).padStart(2, "0"),
-    ].join("-");
+    const dateKey = getLocalDateKey(messageDate);
 
     for (const memberId of getMentionedUserIds(message.content)) {
       if (attendance.has(memberId)) attendance.get(memberId).add(dateKey);
@@ -561,6 +582,8 @@ function buildAttendanceDashboardEmbeds(
   attendance,
   period,
   messageCount,
+  mode = "live",
+  now = new Date(),
 ) {
   const allMembers = [...members];
   const lines = buildRankLines(
@@ -577,22 +600,31 @@ function buildAttendanceDashboardEmbeds(
   const presentCount = attendanceRequiredMembers.filter(
     (member) => attendance.get(member.id).size > 0,
   ).length;
-  const updatedAt = Math.floor(Date.now() / 1_000);
+  const updatedAt = Math.floor(now.getTime() / 1_000);
   const startAt = Math.floor(period.start.getTime() / 1_000);
   const endAt = Math.floor(period.end.getTime() / 1_000);
   const avatarUrl = client.user.displayAvatarURL({ size: 256 });
+  const isArchive = mode === "archive";
+  const isTest = mode === "test";
+  const isFixedOverview = isArchive || isTest;
 
   return chunks.map((chunk, index) => {
     const isFirstPage = index === 0;
     const isLastPage = index === chunks.length - 1;
     const summary = isFirstPage
       ? [
-          "Alle Event Team-leden staan hieronder op rang gesorteerd. Iemand met meerdere rangen staat alleen onder de hoogste rang. Iedere persoon telt maximaal één keer per dag.",
+          isTest
+            ? "🧪 **Dit is een testbericht. Je mag dit bericht verwijderen.** Zo ziet het definitieve weekarchief er op zondag uit."
+            : isArchive
+              ? "Dit is het definitief opgeslagen weekoverzicht van vóór de zondagreset. Dit bericht wordt niet meer live aangepast."
+              : "Alle Event Team-leden staan hieronder op rang gesorteerd. Iemand met meerdere rangen staat alleen onder de hoogste rang. Iedere persoon telt maximaal één keer per dag.",
           "",
           `**Aanwezig deze week:** ${presentCount}/${attendanceRequiredMembers.length}`,
           `**Geen aanwezigheid nodig:** ${exemptCount} leden`,
           `**Periode:** <t:${startAt}:f> tot <t:${endAt}:f>`,
-          `**Automatische reset:** <t:${endAt}:R>`,
+          isFixedOverview
+            ? `**Vastgelegd:** <t:${updatedAt}:f>`
+            : `**Automatische reset:** <t:${endAt}:R>`,
           "",
           "**Beoordeling**",
           "1. 👑 **5/7 dagen**",
@@ -610,13 +642,25 @@ function buildAttendanceDashboardEmbeds(
     if (isFirstPage) {
       embed
         .setAuthor({ name: "Event Team", iconURL: avatarUrl })
-        .setTitle("📋 Wekelijks aanwezigheidsoverzicht")
+        .setTitle(
+          isTest
+            ? "🧪 TEST – weekarchief"
+            : isArchive
+              ? "🗃️ Definitief weekoverzicht"
+              : "📋 Wekelijks aanwezigheidsoverzicht",
+        )
         .setThumbnail(avatarUrl);
     }
 
     if (isLastPage) {
+      const footerText = isTest
+        ? `${CONFIG.attendanceArchiveTestMarker} • testbericht • mag verwijderd worden`
+        : isArchive
+          ? `${CONFIG.attendanceArchiveMarker}:${getLocalDateKey(period.start)} • definitief opgeslagen • ${messageCount} berichten verwerkt`
+          : `${CONFIG.attendanceDashboardMarker} • ${messageCount} berichten verwerkt • iedere 5 minuten live bijgewerkt`;
+
       embed.setFooter({
-        text: `${CONFIG.attendanceDashboardMarker} • ${messageCount} berichten verwerkt • iedere 5 minuten live bijgewerkt`,
+        text: footerText,
       });
       embed.setTimestamp(updatedAt * 1_000);
     }
@@ -823,6 +867,74 @@ async function publishDashboard(channel, embeds, marker) {
   dashboardMessagesByMarker.set(marker, [dashboardMessage]);
 }
 
+async function publishAttendanceArchive(
+  archiveChannel,
+  members,
+  attendance,
+  period,
+  messageCount,
+  now,
+) {
+  const marker = `${CONFIG.attendanceArchiveMarker}:${getLocalDateKey(period.start)}`;
+  const existingMessages = await findDashboardMessages(
+    archiveChannel,
+    marker,
+  );
+
+  if (existingMessages.length > 0) return false;
+
+  const embeds = buildAttendanceDashboardEmbeds(
+    members,
+    attendance,
+    period,
+    messageCount,
+    "archive",
+    now,
+  );
+
+  await archiveChannel.send({
+    embeds,
+    allowedMentions: { parse: [] },
+  });
+  console.log(`Weekarchief ${getLocalDateKey(period.start)} opgeslagen.`);
+  return true;
+}
+
+async function publishAttendanceArchiveTest(
+  archiveChannel,
+  members,
+  attendance,
+  period,
+  messageCount,
+  now,
+) {
+  if (archiveTestSentThisSession) return false;
+
+  const existingMessages = await findDashboardMessages(
+    archiveChannel,
+    CONFIG.attendanceArchiveTestMarker,
+  );
+
+  archiveTestSentThisSession = true;
+  if (existingMessages.length > 0) return false;
+
+  const embeds = buildAttendanceDashboardEmbeds(
+    members,
+    attendance,
+    period,
+    messageCount,
+    "test",
+    now,
+  );
+
+  await archiveChannel.send({
+    embeds,
+    allowedMentions: { parse: [] },
+  });
+  console.log("Testbericht voor het weekarchief geplaatst.");
+  return true;
+}
+
 async function refreshDashboard() {
   if (refreshInProgress) return;
   refreshInProgress = true;
@@ -833,12 +945,14 @@ async function refreshDashboard() {
       overviewChannel,
       inactivityChannel,
       absenceChannel,
+      archiveChannel,
     ] =
       await Promise.all([
         client.channels.fetch(CONFIG.attendanceChannelId),
         client.channels.fetch(CONFIG.overviewChannelId),
         client.channels.fetch(CONFIG.inactivityChannelId),
         client.channels.fetch(CONFIG.absenceChannelId),
+        client.channels.fetch(CONFIG.attendanceArchiveChannelId),
       ]);
 
     if (!attendanceChannel?.isTextBased() || !attendanceChannel.messages) {
@@ -857,13 +971,18 @@ async function refreshDashboard() {
       throw new Error("Het afwezigheidskanaal is geen tekstkanaal.");
     }
 
+    if (!archiveChannel?.isTextBased() || !archiveChannel.messages) {
+      throw new Error("Het weekarchiefkanaal is geen tekstkanaal.");
+    }
+
     const guild = attendanceChannel.guild;
 
     if (
       !guild ||
       overviewChannel.guildId !== guild.id ||
       inactivityChannel.guildId !== guild.id ||
-      absenceChannel.guildId !== guild.id
+      absenceChannel.guildId !== guild.id ||
+      archiveChannel.guildId !== guild.id
     ) {
       throw new Error("De kanalen moeten in dezelfde Discord-server staan.");
     }
@@ -876,10 +995,17 @@ async function refreshDashboard() {
     );
     const now = new Date();
     const period = getWeekPeriod(now);
+    const archivePeriod = isWeeklyArchiveTime(now)
+      ? getMostRecentCompletedWeek(now)
+      : null;
     const monthStart = getMonthStart(now);
     const absenceScanStart = new Date(monthStart);
     absenceScanStart.setMonth(absenceScanStart.getMonth() - 1);
-    const scanStart = Math.min(period.start.getTime(), monthStart.getTime());
+    const scanStart = Math.min(
+      period.start.getTime(),
+      monthStart.getTime(),
+      archivePeriod?.start.getTime() ?? Number.POSITIVE_INFINITY,
+    );
     const [messages, absenceMessages] = await Promise.all([
       fetchMessagesSince(attendanceChannel, scanStart),
       fetchMessagesSince(absenceChannel, absenceScanStart.getTime()),
@@ -905,6 +1031,8 @@ async function refreshDashboard() {
       attendance,
       period,
       weeklyMessages.length,
+      "live",
+      now,
     );
     const inactivityEmbeds = buildInactivityDashboardEmbeds(
       members.values(),
@@ -914,6 +1042,36 @@ async function refreshDashboard() {
       absenceMessages.length,
       now,
     );
+
+    await publishAttendanceArchiveTest(
+      archiveChannel,
+      members.values(),
+      attendance,
+      period,
+      weeklyMessages.length,
+      now,
+    );
+
+    if (archivePeriod) {
+      const archiveMessages = messages.filter(
+        (message) =>
+          message.createdTimestamp >= archivePeriod.start.getTime() &&
+          message.createdTimestamp < archivePeriod.end.getTime(),
+      );
+      const archiveAttendance = collectAttendance(
+        archiveMessages,
+        memberIds,
+      );
+
+      await publishAttendanceArchive(
+        archiveChannel,
+        members.values(),
+        archiveAttendance,
+        archivePeriod,
+        archiveMessages.length,
+        now,
+      );
+    }
 
     await publishDashboard(
       overviewChannel,
@@ -1215,8 +1373,10 @@ module.exports = {
   getMentionedUserIds,
   getInactivityDayCounts,
   getMonthStart,
+  getMostRecentCompletedWeek,
   getVisibleAbsenceRecords,
   getWeekPeriod,
+  isWeeklyArchiveTime,
   loadAllGuildMembers,
   parseAbsenceForm,
   parseCommandDateTime,
