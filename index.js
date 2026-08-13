@@ -11,6 +11,7 @@ process.env.TZ = "Europe/Amsterdam";
 const CONFIG = Object.freeze({
   attendanceChannelId: "1438602360095113390",
   overviewChannelId: "1537247199606608013",
+  inactivityChannelId: "1537255726735691786",
   excludedUserIds: ["683032015045787676"],
   attendanceExemptRoleIds: [
     "1218521637368893471",
@@ -31,8 +32,10 @@ const CONFIG = Object.freeze({
     "1440057853044850780",
   ],
   timeZone: "Europe/Amsterdam",
+  inactivityCutoffHour: 21,
   updateIntervalMs: 5 * 60 * 1000,
-  dashboardMarker: "AFR-WEEKOVERZICHT",
+  attendanceDashboardMarker: "AFR-WEEKOVERZICHT",
+  inactivityDashboardMarker: "AFR-INACTIVITEIT",
 });
 
 const client = new Client({
@@ -44,7 +47,7 @@ const client = new Client({
   ],
 });
 
-let dashboardMessages;
+const dashboardMessagesByMarker = new Map();
 let refreshInProgress = false;
 
 function getWeekPeriod(now = new Date()) {
@@ -66,6 +69,44 @@ function getWeekPeriod(now = new Date()) {
     start,
     end,
   };
+}
+
+function getMonthStart(now = new Date()) {
+  const start = new Date(now);
+  start.setDate(1);
+  start.setHours(0, 0, 0, 0);
+  return start;
+}
+
+function addLocalDays(date, days) {
+  const result = new Date(date);
+  result.setDate(result.getDate() + days);
+  return result;
+}
+
+function getMissedDays(lastActivityTimestamp, trackingStart, now = new Date()) {
+  const current = new Date(now);
+  const hasActivity = Number.isFinite(lastActivityTimestamp);
+  const baseline = new Date(
+    hasActivity ? lastActivityTimestamp : trackingStart,
+  );
+  const firstCutoff = new Date(baseline);
+
+  firstCutoff.setHours(CONFIG.inactivityCutoffHour, 0, 0, 0);
+
+  if (hasActivity || baseline.getTime() > getMonthStart(baseline).getTime()) {
+    firstCutoff.setDate(firstCutoff.getDate() + 1);
+  }
+
+  let missedDays = 0;
+  let cutoff = firstCutoff;
+
+  while (cutoff <= current) {
+    missedDays += 1;
+    cutoff = addLocalDays(cutoff, 1);
+  }
+
+  return missedDays;
 }
 
 function getMentionedUserIds(content) {
@@ -127,6 +168,29 @@ function collectAttendance(messages, allowedMemberIds) {
   return attendance;
 }
 
+function collectLatestActivity(messages, allowedMemberIds) {
+  const latestActivity = new Map(
+    [...allowedMemberIds].map((memberId) => [memberId, null]),
+  );
+
+  for (const message of messages) {
+    for (const memberId of getMentionedUserIds(message.content)) {
+      if (!latestActivity.has(memberId)) continue;
+
+      const currentTimestamp = latestActivity.get(memberId);
+
+      if (
+        currentTimestamp === null ||
+        message.createdTimestamp > currentTimestamp
+      ) {
+        latestActivity.set(memberId, message.createdTimestamp);
+      }
+    }
+  }
+
+  return latestActivity;
+}
+
 function formatAttendanceDates(dateKeys) {
   return [...dateKeys]
     .sort()
@@ -147,7 +211,7 @@ function getMemberRankId(member) {
   return CONFIG.rankRoleIds.find((roleId) => member.roles.cache.has(roleId));
 }
 
-function formatMemberLine(member, attendance) {
+function formatAttendanceMemberLine(member, attendance) {
   if (CONFIG.attendanceExemptRoleIds.includes(getMemberRankId(member))) {
     return `✨ <@${member.id}> — **Geen Aanwezigheid Nodig!**`;
   }
@@ -161,7 +225,7 @@ function formatMemberLine(member, attendance) {
   return `${icon} <@${member.id}> — **${count}/7 dagen**${dateText}`;
 }
 
-function buildRankLines(members, attendance) {
+function buildRankLines(members, formatLine, getSortScore) {
   const groups = new Map(
     CONFIG.rankRoleIds.map((roleId) => [roleId, []]),
   );
@@ -179,7 +243,7 @@ function buildRankLines(members, attendance) {
       }
 
       const countDifference =
-        attendance.get(memberB.id).size - attendance.get(memberA.id).size;
+        getSortScore(memberB) - getSortScore(memberA);
 
       return (
         countDifference ||
@@ -195,9 +259,7 @@ function buildRankLines(members, attendance) {
       continue;
     }
 
-    lines.push(
-      ...rankMembers.map((member) => formatMemberLine(member, attendance)),
-    );
+    lines.push(...rankMembers.map(formatLine));
   }
 
   return lines;
@@ -227,9 +289,18 @@ function chunkLines(lines, maximumLength = 3_500) {
   return chunks.length > 0 ? chunks : [["Er zijn geen leden met deze rol."]];
 }
 
-function buildDashboardEmbeds(members, attendance, period, messageCount) {
+function buildAttendanceDashboardEmbeds(
+  members,
+  attendance,
+  period,
+  messageCount,
+) {
   const allMembers = [...members];
-  const lines = buildRankLines(allMembers, attendance);
+  const lines = buildRankLines(
+    allMembers,
+    (member) => formatAttendanceMemberLine(member, attendance),
+    (member) => attendance.get(member.id).size,
+  );
   const chunks = chunkLines(lines);
   const attendanceRequiredMembers = allMembers.filter(
     (member) =>
@@ -278,7 +349,7 @@ function buildDashboardEmbeds(members, attendance, period, messageCount) {
 
     if (isLastPage) {
       embed.setFooter({
-        text: `${CONFIG.dashboardMarker} • ${messageCount} berichten verwerkt • iedere 5 minuten live bijgewerkt`,
+        text: `${CONFIG.attendanceDashboardMarker} • ${messageCount} berichten verwerkt • iedere 5 minuten live bijgewerkt`,
       });
       embed.setTimestamp(updatedAt * 1_000);
     }
@@ -287,7 +358,111 @@ function buildDashboardEmbeds(members, attendance, period, messageCount) {
   });
 }
 
-async function findDashboardMessages(channel) {
+function getMemberInactivity(member, latestActivity, monthStart, now) {
+  const lastActivityTimestamp = latestActivity.get(member.id);
+  const trackingStart = new Date(
+    Math.max(monthStart.getTime(), member.joinedTimestamp || 0),
+  );
+
+  return {
+    lastActivityTimestamp,
+    missedDays: getMissedDays(lastActivityTimestamp, trackingStart, now),
+  };
+}
+
+function formatInactivityMemberLine(member, inactivity) {
+  if (CONFIG.attendanceExemptRoleIds.includes(getMemberRankId(member))) {
+    return `✨ <@${member.id}> — **Geen Inactiviteit bijhouden!**`;
+  }
+
+  const { lastActivityTimestamp, missedDays } = inactivity.get(member.id);
+
+  if (missedDays >= 2) {
+    const lastSeenText = lastActivityTimestamp
+      ? ` · laatst meegedaan <t:${Math.floor(lastActivityTimestamp / 1_000)}:R>`
+      : " · deze maand nog niet meegedaan";
+
+    return `🔴 <@${member.id}> — **${missedDays} dagen inactief**${lastSeenText}`;
+  }
+
+  const lastSeenText = lastActivityTimestamp
+    ? ` · laatst meegedaan <t:${Math.floor(lastActivityTimestamp / 1_000)}:R>`
+    : " · deze maand nog niet meegedaan";
+
+  return `🟢 <@${member.id}> — **Actief** · ${missedDays}/2 gemiste dagen${lastSeenText}`;
+}
+
+function buildInactivityDashboardEmbeds(
+  members,
+  latestActivity,
+  monthStart,
+  messageCount,
+  now = new Date(),
+) {
+  const allMembers = [...members];
+  const inactivity = new Map(
+    allMembers.map((member) => [
+      member.id,
+      getMemberInactivity(member, latestActivity, monthStart, now),
+    ]),
+  );
+  const lines = buildRankLines(
+    allMembers,
+    (member) => formatInactivityMemberLine(member, inactivity),
+    (member) => inactivity.get(member.id).missedDays,
+  );
+  const chunks = chunkLines(lines);
+  const trackedMembers = allMembers.filter(
+    (member) =>
+      !CONFIG.attendanceExemptRoleIds.includes(getMemberRankId(member)),
+  );
+  const exemptCount = allMembers.length - trackedMembers.length;
+  const inactiveCount = trackedMembers.filter(
+    (member) => inactivity.get(member.id).missedDays >= 2,
+  ).length;
+  const updatedAt = Math.floor(now.getTime() / 1_000);
+  const monthStartAt = Math.floor(monthStart.getTime() / 1_000);
+  const avatarUrl = client.user.displayAvatarURL({ size: 256 });
+
+  return chunks.map((chunk, index) => {
+    const isFirstPage = index === 0;
+    const isLastPage = index === chunks.length - 1;
+    const summary = isFirstPage
+      ? [
+          "Dit overzicht is gekoppeld aan dezelfde aanwezigheidsberichten. Een deelname zet de inactiviteit direct terug naar nul.",
+          "",
+          `**Inactief:** ${inactiveCount}/${trackedMembers.length}`,
+          `**Geen inactiviteit bijhouden:** ${exemptCount} leden`,
+          `**Meten vanaf:** <t:${monthStartAt}:D>`,
+          `**Dagelijkse peiling:** 21:00 uur`,
+          "**Inactief vanaf:** 2 gemiste dagen achter elkaar",
+          "",
+        ]
+      : [];
+
+    const embed = new EmbedBuilder()
+      .setColor(0xff4d4d)
+      .setDescription([...summary, ...chunk].join("\n"));
+
+    if (isFirstPage) {
+      embed
+        .setAuthor({ name: "Event Team", iconURL: avatarUrl })
+        .setTitle("⏳ Inactiviteitsoverzicht")
+        .setThumbnail(avatarUrl);
+    }
+
+    if (isLastPage) {
+      embed.setFooter({
+        text: `${CONFIG.inactivityDashboardMarker} • ${messageCount} berichten verwerkt • iedere 5 minuten live bijgewerkt`,
+      });
+      embed.setTimestamp(updatedAt * 1_000);
+    }
+
+    return embed;
+  });
+}
+
+async function findDashboardMessages(channel, marker) {
   const recentMessages = await channel.messages.fetch({ limit: 100 });
 
   return [...recentMessages.values()]
@@ -295,15 +470,17 @@ async function findDashboardMessages(channel) {
       (message) =>
         message.author.id === client.user.id &&
         message.embeds.some((embed) =>
-          embed.footer?.text?.startsWith(CONFIG.dashboardMarker),
+          embed.footer?.text?.startsWith(marker),
         ),
     )
     .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
 }
 
-async function publishDashboard(channel, embeds) {
+async function publishDashboard(channel, embeds, marker) {
+  let dashboardMessages = dashboardMessagesByMarker.get(marker);
+
   if (!dashboardMessages) {
-    dashboardMessages = await findDashboardMessages(channel);
+    dashboardMessages = await findDashboardMessages(channel, marker);
   }
 
   const payload = {
@@ -318,7 +495,7 @@ async function publishDashboard(channel, embeds) {
     await extraMessage.delete().catch(() => undefined);
   }
 
-  dashboardMessages = [dashboardMessage];
+  dashboardMessagesByMarker.set(marker, [dashboardMessage]);
 }
 
 async function refreshDashboard() {
@@ -326,10 +503,12 @@ async function refreshDashboard() {
   refreshInProgress = true;
 
   try {
-    const [attendanceChannel, overviewChannel] = await Promise.all([
-      client.channels.fetch(CONFIG.attendanceChannelId),
-      client.channels.fetch(CONFIG.overviewChannelId),
-    ]);
+    const [attendanceChannel, overviewChannel, inactivityChannel] =
+      await Promise.all([
+        client.channels.fetch(CONFIG.attendanceChannelId),
+        client.channels.fetch(CONFIG.overviewChannelId),
+        client.channels.fetch(CONFIG.inactivityChannelId),
+      ]);
 
     if (!attendanceChannel?.isTextBased() || !attendanceChannel.messages) {
       throw new Error("Het aanwezigheidskanaal is geen tekstkanaal.");
@@ -339,9 +518,17 @@ async function refreshDashboard() {
       throw new Error("Het overzichtskanaal is geen tekstkanaal.");
     }
 
+    if (!inactivityChannel?.isTextBased() || !inactivityChannel.messages) {
+      throw new Error("Het inactiviteitskanaal is geen tekstkanaal.");
+    }
+
     const guild = attendanceChannel.guild;
 
-    if (!guild || overviewChannel.guildId !== guild.id) {
+    if (
+      !guild ||
+      overviewChannel.guildId !== guild.id ||
+      inactivityChannel.guildId !== guild.id
+    ) {
       throw new Error("De kanalen moeten in dezelfde Discord-server staan.");
     }
 
@@ -353,25 +540,51 @@ async function refreshDashboard() {
         !CONFIG.excludedUserIds.includes(member.id) &&
         CONFIG.rankRoleIds.some((roleId) => member.roles.cache.has(roleId)),
     );
-    const period = getWeekPeriod();
-    const messages = await fetchMessagesSince(
-      attendanceChannel,
-      period.start.getTime(),
+    const now = new Date();
+    const period = getWeekPeriod(now);
+    const monthStart = getMonthStart(now);
+    const scanStart = Math.min(period.start.getTime(), monthStart.getTime());
+    const messages = await fetchMessagesSince(attendanceChannel, scanStart);
+    const weeklyMessages = messages.filter(
+      (message) =>
+        message.createdTimestamp >= period.start.getTime() &&
+        message.createdTimestamp < period.end.getTime(),
     );
-    const attendance = collectAttendance(messages, new Set(members.keys()));
-    const embeds = buildDashboardEmbeds(
+    const monthlyMessages = messages.filter(
+      (message) => message.createdTimestamp >= monthStart.getTime(),
+    );
+    const memberIds = new Set(members.keys());
+    const attendance = collectAttendance(weeklyMessages, memberIds);
+    const latestActivity = collectLatestActivity(monthlyMessages, memberIds);
+    const attendanceEmbeds = buildAttendanceDashboardEmbeds(
       members.values(),
       attendance,
       period,
-      messages.length,
+      weeklyMessages.length,
+    );
+    const inactivityEmbeds = buildInactivityDashboardEmbeds(
+      members.values(),
+      latestActivity,
+      monthStart,
+      monthlyMessages.length,
+      now,
     );
 
-    await publishDashboard(overviewChannel, embeds);
+    await publishDashboard(
+      overviewChannel,
+      attendanceEmbeds,
+      CONFIG.attendanceDashboardMarker,
+    );
+    await publishDashboard(
+      inactivityChannel,
+      inactivityEmbeds,
+      CONFIG.inactivityDashboardMarker,
+    );
     console.log(
-      `Aanwezigheid bijgewerkt: ${members.size} leden, ${messages.length} berichten.`,
+      `Dashboards bijgewerkt: ${members.size} leden, ${monthlyMessages.length} maandberichten.`,
     );
   } catch (error) {
-    console.error("Het aanwezigheidsoverzicht kon niet worden bijgewerkt:", error);
+    console.error("De dashboards konden niet worden bijgewerkt:", error);
   } finally {
     refreshInProgress = false;
   }
@@ -386,6 +599,24 @@ function scheduleDashboardUpdates() {
     setInterval(() => void refreshDashboard(), CONFIG.updateIntervalMs);
   }, delayUntilNextUpdate);
 }
+
+client.on(Events.MessageCreate, (message) => {
+  if (message.channelId === CONFIG.attendanceChannelId) {
+    void refreshDashboard();
+  }
+});
+
+client.on(Events.MessageUpdate, (_oldMessage, newMessage) => {
+  if (newMessage.channelId === CONFIG.attendanceChannelId) {
+    void refreshDashboard();
+  }
+});
+
+client.on(Events.MessageDelete, (message) => {
+  if (message.channelId === CONFIG.attendanceChannelId) {
+    void refreshDashboard();
+  }
+});
 
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Bot is online als ${readyClient.user.tag}.`);
@@ -413,7 +644,10 @@ if (require.main === module) void startBot();
 
 module.exports = {
   collectAttendance,
+  collectLatestActivity,
+  getMissedDays,
   getMemberRankId,
   getMentionedUserIds,
+  getMonthStart,
   getWeekPeriod,
 };
