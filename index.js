@@ -15,7 +15,9 @@ const CONFIG = Object.freeze({
   inactivityChannelId: "1537255726735691786",
   absenceChannelId: "1509628813628280842",
   attendanceArchiveChannelId: "1537265369352372346",
+  warningChannelId: "1440369548388732949",
   absenceCommandRoleId: "1218521637368893471",
+  warningCommandRoleId: "1537254102529085480",
   excludedUserIds: ["683032015045787676"],
   attendanceExemptRoleIds: [
     "1218521637368893471",
@@ -90,6 +92,58 @@ const absenceCommand = new SlashCommandBuilder()
           .setDescription("De persoon die uit de afwezigheidslijst moet.")
           .setRequired(true),
       ),
+  );
+
+const warningCommand = new SlashCommandBuilder()
+  .setName("warn")
+  .setDescription("Plaats een waarschuwing of ontslagmelding.")
+  .setDefaultMemberPermissions(0)
+  .setDMPermission(false)
+  .addStringOption((option) =>
+    option
+      .setName("type")
+      .setDescription("Kies een waarschuwing of ontslag.")
+      .setRequired(true)
+      .addChoices(
+        { name: "Waarschuwing", value: "waarschuwing" },
+        { name: "Ontslagen", value: "ontslagen" },
+      ),
+  )
+  .addRoleOption((option) =>
+    option
+      .setName("huidige_rang")
+      .setDescription("De huidige rang van de persoon.")
+      .setRequired(true),
+  )
+  .addStringOption((option) =>
+    option
+      .setName("reden")
+      .setDescription("De reden voor de waarschuwing of het ontslag.")
+      .setMaxLength(1000)
+      .setRequired(true),
+  )
+  .addStringOption((option) =>
+    option
+      .setName("bron")
+      .setDescription("De verplichte bron of bewijsverwijzing.")
+      .setMaxLength(1000)
+      .setRequired(true),
+  )
+  .addUserOption((option) =>
+    option
+      .setName("persoon")
+      .setDescription("Kies de persoon als die nog in Discord staat."),
+  )
+  .addStringOption((option) =>
+    option
+      .setName("naam")
+      .setDescription("Losse naam of gebruikers-ID als de persoon al weg is.")
+      .setMaxLength(100),
+  )
+  .addRoleOption((option) =>
+    option
+      .setName("sanctie")
+      .setDescription("Sanctierol die bij een waarschuwing wordt gegeven."),
   );
 
 const client = new Client({
@@ -1103,20 +1157,209 @@ function scheduleDashboardUpdates() {
   }, delayUntilNextUpdate);
 }
 
-async function registerAbsenceCommand(guild) {
+async function registerCommands(guild) {
   const commands = await guild.commands.fetch();
-  const existingCommand = commands.find(
-    (command) => command.name === absenceCommand.name,
-  );
-  const commandData = absenceCommand.toJSON();
+  const commandBuilders = [absenceCommand, warningCommand];
 
-  if (existingCommand) {
-    await existingCommand.edit(commandData);
-  } else {
-    await guild.commands.create(commandData);
+  for (const commandBuilder of commandBuilders) {
+    const existingCommand = commands.find(
+      (command) => command.name === commandBuilder.name,
+    );
+    const commandData = commandBuilder.toJSON();
+
+    if (existingCommand) {
+      await existingCommand.edit(commandData);
+    } else {
+      await guild.commands.create(commandData);
+    }
   }
 
-  console.log("Slash-command /afwezig is geregistreerd.");
+  console.log("Slash-commands /afwezig en /warn zijn geregistreerd.");
+}
+
+function getRemovableRoleIds(member, botMember) {
+  const botHighestPosition = botMember.roles.highest.position;
+
+  return member.roles.cache
+    .filter(
+      (role) =>
+        role.id !== member.guild.id &&
+        !role.managed &&
+        role.position < botHighestPosition,
+    )
+    .map((role) => role.id);
+}
+
+function cleanEmbedValue(value, maximumLength = 1000) {
+  return String(value || "")
+    .replace(/\r?\n/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maximumLength);
+}
+
+async function resolveWarningTarget(interaction) {
+  const selectedUser = interaction.options.getUser("persoon");
+  const typedName = cleanEmbedValue(interaction.options.getString("naam"), 100);
+
+  if ((selectedUser && typedName) || (!selectedUser && !typedName)) {
+    throw new Error("Vul precies één van `persoon` of `naam` in.");
+  }
+
+  const typedUserId = typedName.match(/^\d{17,20}$/)?.[0];
+  const userId = selectedUser?.id || typedUserId;
+  let member = userId
+    ? interaction.guild.members.cache.get(userId) || null
+    : null;
+
+  if (!member && selectedUser) {
+    member = await interaction.guild.members
+      .fetch(selectedUser.id)
+      .catch(() => null);
+  }
+
+  if (!member && typedUserId) {
+    member = await interaction.guild.members
+      .fetch(typedUserId)
+      .catch(() => null);
+  }
+
+  return {
+    member,
+    display: userId ? `<@${userId}>` : typedName,
+  };
+}
+
+async function handleWarningCommand(interaction) {
+  if (
+    !interaction.isChatInputCommand() ||
+    interaction.commandName !== warningCommand.name
+  ) {
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  try {
+    if (!interaction.inGuild()) {
+      throw new Error("Deze command werkt alleen in de Discord-server.");
+    }
+
+    const executor =
+      interaction.guild.members.cache.get(interaction.user.id) ??
+      (await interaction.guild.members.fetch(interaction.user.id));
+
+    if (!executor.roles.cache.has(CONFIG.warningCommandRoleId)) {
+      throw new Error(
+        `Alleen leden met <@&${CONFIG.warningCommandRoleId}> mogen deze command gebruiken.`,
+      );
+    }
+
+    const type = interaction.options.getString("type", true);
+    const currentRank = interaction.options.getRole("huidige_rang", true);
+    const reason = cleanEmbedValue(
+      interaction.options.getString("reden", true),
+    );
+    const source = cleanEmbedValue(
+      interaction.options.getString("bron", true),
+    );
+    const sanctionRole = interaction.options.getRole("sanctie");
+    const target = await resolveWarningTarget(interaction);
+    const botMember = interaction.guild.members.me;
+
+    if (!botMember) {
+      throw new Error("De eigen botrol kon niet worden gevonden.");
+    }
+
+    const warningChannel = await client.channels.fetch(CONFIG.warningChannelId);
+
+    if (!warningChannel?.isTextBased() || !warningChannel.messages) {
+      throw new Error("Het waarschuwingenkanaal is geen tekstkanaal.");
+    }
+
+    if (warningChannel.guildId !== interaction.guildId) {
+      throw new Error("Het waarschuwingenkanaal staat niet in deze server.");
+    }
+
+    let sanctionText;
+
+    if (type === "waarschuwing") {
+      if (!target.member) {
+        throw new Error(
+          "Voor een waarschuwing moet je een persoon kiezen die nog in de server zit.",
+        );
+      }
+
+      if (!sanctionRole) {
+        throw new Error("Bij een waarschuwing is `sanctie` verplicht.");
+      }
+
+      if (
+        sanctionRole.id === interaction.guild.id ||
+        sanctionRole.managed ||
+        sanctionRole.position >= botMember.roles.highest.position
+      ) {
+        throw new Error(
+          "De sanctierol moet een normale rol onder de hoogste botrol zijn.",
+        );
+      }
+
+      await target.member.roles.add(
+        sanctionRole,
+        `Waarschuwing door ${interaction.user.tag}: ${reason}`,
+      );
+      sanctionText = `<@&${sanctionRole.id}> — toegekend`;
+    } else {
+      if (sanctionRole) {
+        throw new Error(
+          "Kies bij ontslag geen sanctierol; alle rollen onder de bot worden verwijderd.",
+        );
+      }
+
+      if (target.member) {
+        const removableRoleIds = getRemovableRoleIds(target.member, botMember);
+
+        if (removableRoleIds.length > 0) {
+          await target.member.roles.remove(
+            removableRoleIds,
+            `Ontslagen door ${interaction.user.tag}: ${reason}`,
+          );
+        }
+
+        sanctionText = `${removableRoleIds.length} verwijderbare ${removableRoleIds.length === 1 ? "rol" : "rollen"} verwijderd; rollen op of boven de bot zijn behouden`;
+      } else {
+        sanctionText =
+          "Persoon was al uit de server — alleen de ontslagmelding is vastgelegd";
+      }
+    }
+
+    const typeLabel = type === "waarschuwing" ? "Waarschuwing" : "Ontslagen";
+    const warningEmbed = new EmbedBuilder()
+      .setColor(type === "waarschuwing" ? 0xffa500 : 0xed4245)
+      .setTitle(`${typeLabel} ❌`)
+      .setDescription(
+        [
+          `> **Naam:** ${target.display}`,
+          `> **Huidige rang:** <@&${currentRank.id}>`,
+          `> **Reden:** ${reason}`,
+          `> **Bron:** ${source}`,
+          `> **Sanctie:** ${sanctionText}`,
+        ].join("\n"),
+      )
+      .setFooter({ text: `Uitgevoerd door ${interaction.user.tag}` })
+      .setTimestamp();
+
+    await warningChannel.send({
+      embeds: [warningEmbed],
+      allowedMentions: { parse: [] },
+    });
+
+    await interaction.editReply(
+      `✅ ${typeLabel} voor ${target.display} is verwerkt en geplaatst in <#${CONFIG.warningChannelId}>.`,
+    );
+  } catch (error) {
+    await interaction.editReply(`❌ ${error.message}`);
+  }
 }
 
 async function getTrackedTargetMember(interaction) {
@@ -1266,7 +1509,13 @@ async function handleAbsenceCommand(interaction) {
 }
 
 client.on(Events.InteractionCreate, (interaction) => {
-  void handleAbsenceCommand(interaction);
+  if (!interaction.isChatInputCommand()) return;
+
+  if (interaction.commandName === absenceCommand.name) {
+    void handleAbsenceCommand(interaction);
+  } else if (interaction.commandName === warningCommand.name) {
+    void handleWarningCommand(interaction);
+  }
 });
 
 client.on(Events.MessageCreate, (message) => {
@@ -1345,9 +1594,9 @@ client.once(Events.ClientReady, async (readyClient) => {
       throw new Error("De Discord-server kon niet worden gevonden.");
     }
 
-    await registerAbsenceCommand(dashboardGuild);
+    await registerCommands(dashboardGuild);
   } catch (error) {
-    console.error("Slash-command /afwezig kon niet worden geregistreerd:", error);
+    console.error("De slash-commands konden niet worden geregistreerd:", error);
   }
 
   await refreshDashboard();
@@ -1374,6 +1623,7 @@ module.exports = {
   getInactivityDayCounts,
   getMonthStart,
   getMostRecentCompletedWeek,
+  getRemovableRoleIds,
   getVisibleAbsenceRecords,
   getWeekPeriod,
   isWeeklyArchiveTime,
