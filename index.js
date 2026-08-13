@@ -1,5 +1,6 @@
 const path = require("node:path");
 const {
+  AuditLogEvent,
   Client,
   EmbedBuilder,
   Events,
@@ -16,6 +17,7 @@ const CONFIG = Object.freeze({
   absenceChannelId: "1509628813628280842",
   attendanceArchiveChannelId: "1537265369352372346",
   warningChannelId: "1440369548388732949",
+  acceptedChannelId: "1449466069613019217",
   absenceCommandRoleId: "1218521637368893471",
   warningCommandRoleId: "1537254102529085480",
   excludedUserIds: ["683032015045787676"],
@@ -146,6 +148,12 @@ const warningCommand = new SlashCommandBuilder()
       .setDescription("Sanctierol die bij een waarschuwing wordt gegeven."),
   );
 
+const sheetTestCommand = new SlashCommandBuilder()
+  .setName("sheettest")
+  .setDescription("Controleer de spreadsheetkoppeling zonder gegevens te wijzigen.")
+  .setDefaultMemberPermissions(0)
+  .setDMPermission(false);
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -159,6 +167,63 @@ const dashboardMessagesByMarker = new Map();
 let refreshInProgress = false;
 let dashboardGuildId = null;
 let archiveTestSentThisSession = false;
+let spreadsheetConfigurationWarningShown = false;
+
+async function sendSpreadsheetEvent(type, data) {
+  const webhookUrl = process.env.SHEET_WEBHOOK_URL;
+  const webhookSecret = process.env.SHEET_WEBHOOK_SECRET;
+
+  if (!webhookUrl || !webhookSecret) {
+    if (!spreadsheetConfigurationWarningShown) {
+      spreadsheetConfigurationWarningShown = true;
+      console.warn(
+        "Spreadsheetkoppeling staat uit: SHEET_WEBHOOK_URL of SHEET_WEBHOOK_SECRET ontbreekt.",
+      );
+    }
+    return false;
+  }
+
+  const response = await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      secret: webhookSecret,
+      type,
+      sentAt: new Date().toISOString(),
+      data,
+    }),
+    signal: AbortSignal.timeout(15_000),
+  });
+
+  const responseText = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Spreadsheet-webhook gaf HTTP ${response.status}: ${responseText.slice(0, 300)}`,
+    );
+  }
+
+  let result;
+
+  try {
+    result = JSON.parse(responseText);
+  } catch {
+    throw new Error("Spreadsheet-webhook gaf geen geldig JSON-antwoord.");
+  }
+
+  if (!result.ok) {
+    throw new Error(result.error || "Spreadsheet-update is geweigerd.");
+  }
+
+  console.log(`Spreadsheet-update ${type} geslaagd.`);
+  return result.result ?? true;
+}
+
+function queueSpreadsheetEvent(type, data) {
+  void sendSpreadsheetEvent(type, data).catch((error) => {
+    console.error(`Spreadsheet-update ${type} is mislukt:`, error);
+  });
+}
 
 async function loadAllGuildMembers(guild) {
   let after;
@@ -370,6 +435,68 @@ function getMessageText(message) {
     .filter(Boolean)
     .join("\n")
     .replace(/\*\*/g, "");
+}
+
+function getRoleSnapshot(member) {
+  const rankRoleId = getMemberRankId(member);
+  const rankRole = rankRoleId ? member.guild.roles.cache.get(rankRoleId) : null;
+
+  return {
+    discordId: member.id,
+    name: member.displayName,
+    rankRoleId,
+    rankName: rankRole?.name || null,
+  };
+}
+
+async function getRecentRoleChangeExecutor(guild, targetId) {
+  try {
+    const auditLogs = await guild.fetchAuditLogs({
+      type: AuditLogEvent.MemberRoleUpdate,
+      limit: 6,
+    });
+    const now = Date.now();
+    const entry = auditLogs.entries.find(
+      (auditEntry) =>
+        auditEntry.targetId === targetId &&
+        now - auditEntry.createdTimestamp < 20_000,
+    );
+
+    return entry?.executor
+      ? {
+          id: entry.executor.id,
+          name: entry.executor.globalName || entry.executor.username,
+        }
+      : null;
+  } catch (error) {
+    console.warn(
+      "Uitvoerder van rolwijziging kon niet uit het auditlog worden gelezen:",
+      error.message,
+    );
+    return null;
+  }
+}
+
+function parseAcceptedMemberMessage(message) {
+  const text = getMessageText(message);
+  const discordId = getFormValue(text, "Discord ID").match(/\d{17,20}/)?.[0];
+  const nameValue = getFormValue(text, "Naam");
+  const mentionedNameId = nameValue.match(/<@!?(\d{17,20})>/)?.[1];
+  const acceptedByValue = getFormValue(text, "Aangenomen door");
+  const acceptedById = acceptedByValue.match(/<@!?(\d{17,20})>/)?.[1];
+  const acceptedDate = getFormValue(text, "Datum aangenomen");
+  const targetId = discordId || mentionedNameId;
+
+  if (!targetId || !acceptedDate) return null;
+
+  return {
+    discordId: targetId,
+    name: nameValue || `<@${targetId}>`,
+    acceptedDate,
+    acceptedById: acceptedById || null,
+    acceptedByName: acceptedByValue || null,
+    sourceMessageId: message.id,
+  };
 }
 
 function getMarkedUserId(message, marker) {
@@ -1159,7 +1286,7 @@ function scheduleDashboardUpdates() {
 
 async function registerCommands(guild) {
   const commands = await guild.commands.fetch();
-  const commandBuilders = [absenceCommand, warningCommand];
+  const commandBuilders = [absenceCommand, warningCommand, sheetTestCommand];
 
   for (const commandBuilder of commandBuilders) {
     const existingCommand = commands.find(
@@ -1174,7 +1301,60 @@ async function registerCommands(guild) {
     }
   }
 
-  console.log("Slash-commands /afwezig en /warn zijn geregistreerd.");
+  console.log(
+    "Slash-commands /afwezig, /warn en /sheettest zijn geregistreerd.",
+  );
+}
+
+async function handleSheetTestCommand(interaction) {
+  if (
+    !interaction.isChatInputCommand() ||
+    interaction.commandName !== sheetTestCommand.name
+  ) {
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  try {
+    if (!interaction.inGuild()) {
+      throw new Error("Deze command werkt alleen in de Discord-server.");
+    }
+
+    const executor =
+      interaction.guild.members.cache.get(interaction.user.id) ??
+      (await interaction.guild.members.fetch(interaction.user.id));
+
+    if (!executor.roles.cache.has(CONFIG.warningCommandRoleId)) {
+      throw new Error(
+        `Alleen leden met <@&${CONFIG.warningCommandRoleId}> mogen deze command gebruiken.`,
+      );
+    }
+
+    const result = await sendSpreadsheetEvent("ping", {
+      actorId: interaction.user.id,
+      actorName: interaction.user.username,
+    });
+
+    if (!result) {
+      throw new Error(
+        "SHEET_WEBHOOK_URL of SHEET_WEBHOOK_SECRET ontbreekt bij de hosting.",
+      );
+    }
+
+    await interaction.editReply(
+      [
+        "✅ **Spreadsheetverbinding werkt**",
+        `**Spreadsheet-ID:** \`${result.spreadsheetId}\``,
+        `**Tabblad:** \`${result.sheetName}\``,
+        `**Kopregel:** ${result.headerRow}`,
+        `**Laatste gebruikte rij:** ${result.lastDataRow}`,
+        "Er zijn geen cellen gewijzigd.",
+      ].join("\n"),
+    );
+  } catch (error) {
+    await interaction.editReply(`❌ Spreadsheettest mislukt: ${error.message}`);
+  }
 }
 
 function getRemovableRoleIds(member, botMember) {
@@ -1354,6 +1534,20 @@ async function handleWarningCommand(interaction) {
       allowedMentions: { parse: [] },
     });
 
+    queueSpreadsheetEvent(type === "waarschuwing" ? "warning" : "terminated", {
+      discordId: target.member?.id || target.display.match(/\d{17,20}/)?.[0] || null,
+      name: target.member?.displayName || target.display,
+      currentRankRoleId: currentRank.id,
+      currentRankName: currentRank.name,
+      reason,
+      source,
+      sanctionRoleId: sanctionRole?.id || null,
+      sanctionName: sanctionRole?.name || sanctionText,
+      actorId: interaction.user.id,
+      actorName: interaction.member?.displayName || interaction.user.globalName || interaction.user.username,
+      occurredAt: new Date().toISOString(),
+    });
+
     await interaction.editReply(
       `✅ ${typeLabel} voor ${target.display} is verwerkt en geplaatst in <#${CONFIG.warningChannelId}>.`,
     );
@@ -1515,6 +1709,8 @@ client.on(Events.InteractionCreate, (interaction) => {
     void handleAbsenceCommand(interaction);
   } else if (interaction.commandName === warningCommand.name) {
     void handleWarningCommand(interaction);
+  } else if (interaction.commandName === sheetTestCommand.name) {
+    void handleSheetTestCommand(interaction);
   }
 });
 
@@ -1524,6 +1720,22 @@ client.on(Events.MessageCreate, (message) => {
     message.channelId === CONFIG.absenceChannelId
   ) {
     void refreshDashboard();
+  }
+
+  if (message.channelId === CONFIG.acceptedChannelId) {
+    const acceptedMember = parseAcceptedMemberMessage(message);
+
+    if (acceptedMember) {
+      const member = message.guild?.members.cache.get(acceptedMember.discordId);
+      const snapshot = member ? getRoleSnapshot(member) : {};
+
+      queueSpreadsheetEvent("accepted", {
+        ...acceptedMember,
+        name: member?.displayName || acceptedMember.name,
+        rankRoleId: snapshot.rankRoleId || null,
+        rankName: snapshot.rankName || null,
+      });
+    }
   }
 });
 
@@ -1551,10 +1763,63 @@ client.on(Events.GuildMemberAdd, (member) => {
 
 client.on(Events.GuildMemberRemove, (member) => {
   if (member.guild.id === dashboardGuildId) void refreshDashboard();
+
+  queueSpreadsheetEvent("departed", {
+    ...getRoleSnapshot(member),
+    actorId: null,
+    actorName: "Server verlaten",
+    occurredAt: new Date().toISOString(),
+  });
 });
 
-client.on(Events.GuildMemberUpdate, (_oldMember, newMember) => {
+client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
   if (newMember.guild.id === dashboardGuildId) void refreshDashboard();
+
+  const addedRoleIds = newMember.roles.cache
+    .filter((role) => !oldMember.roles.cache.has(role.id))
+    .map((role) => role.id);
+  const removedRoleIds = oldMember.roles.cache
+    .filter((role) => !newMember.roles.cache.has(role.id))
+    .map((role) => role.id);
+
+  if (addedRoleIds.length > 0 || removedRoleIds.length > 0) {
+    console.log(
+      `Rolwijziging ${newMember.id}: toegevoegd [${addedRoleIds.join(", ") || "geen"}], verwijderd [${removedRoleIds.join(", ") || "geen"}].`,
+    );
+  }
+
+  const oldRank = getRoleSnapshot(oldMember);
+  const newRank = getRoleSnapshot(newMember);
+
+  if (oldRank.rankRoleId === newRank.rankRoleId) {
+    if (addedRoleIds.length > 0 || removedRoleIds.length > 0) {
+      console.log(
+        `Geen gekoppelde rangwissel voor ${newMember.id}; actieve rang blijft ${newRank.rankRoleId || "geen"}.`,
+      );
+    }
+    return;
+  }
+
+  console.log(
+    `Gekoppelde rangwissel ${newMember.id}: ${oldRank.rankName || "geen"} -> ${newRank.rankName || "geen"}.`,
+  );
+
+  const executor = await getRecentRoleChangeExecutor(
+    newMember.guild,
+    newMember.id,
+  );
+
+  queueSpreadsheetEvent(newRank.rankRoleId ? "rank_changed" : "departed", {
+    discordId: newMember.id,
+    name: newMember.displayName,
+    oldRankRoleId: oldRank.rankRoleId,
+    oldRankName: oldRank.rankName,
+    newRankRoleId: newRank.rankRoleId,
+    newRankName: newRank.rankName,
+    actorId: executor?.id || null,
+    actorName: executor?.name || "Onbekend",
+    occurredAt: new Date().toISOString(),
+  });
 });
 
 client.on(Events.Error, (error) => {
@@ -1599,6 +1864,22 @@ client.once(Events.ClientReady, async (readyClient) => {
     console.error("De slash-commands konden niet worden geregistreerd:", error);
   }
 
+  try {
+    const spreadsheet = await sendSpreadsheetEvent("ping", {
+      actorId: readyClient.user.id,
+      actorName: readyClient.user.username,
+      source: "startup",
+    });
+
+    if (spreadsheet) {
+      console.log(
+        `Spreadsheet verbonden: ${spreadsheet.spreadsheetId} / ${spreadsheet.sheetName}.`,
+      );
+    }
+  } catch (error) {
+    console.error("Spreadsheetverbindingstest bij opstarten mislukt:", error);
+  }
+
   await refreshDashboard();
   scheduleDashboardUpdates();
 });
@@ -1629,5 +1910,6 @@ module.exports = {
   isWeeklyArchiveTime,
   loadAllGuildMembers,
   parseAbsenceForm,
+  parseAcceptedMemberMessage,
   parseCommandDateTime,
 };
