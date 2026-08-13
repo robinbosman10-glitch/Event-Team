@@ -300,26 +300,19 @@ async function publishDashboard(channel, embeds) {
     dashboardMessages = await findDashboardMessages(channel);
   }
 
-  const publishedMessages = [];
+  const payload = {
+    embeds,
+    allowedMentions: { parse: [] },
+  };
+  const dashboardMessage = dashboardMessages[0]
+    ? await dashboardMessages[0].edit(payload)
+    : await channel.send(payload);
 
-  for (let index = 0; index < embeds.length; index += 1) {
-    const payload = {
-      embeds: [embeds[index]],
-      allowedMentions: { parse: [] },
-    };
-
-    if (dashboardMessages[index]) {
-      publishedMessages.push(await dashboardMessages[index].edit(payload));
-    } else {
-      publishedMessages.push(await channel.send(payload));
-    }
-  }
-
-  for (const extraMessage of dashboardMessages.slice(embeds.length)) {
+  for (const extraMessage of dashboardMessages.slice(1)) {
     await extraMessage.delete().catch(() => undefined);
   }
 
-  dashboardMessages = publishedMessages;
+  dashboardMessages = [dashboardMessage];
 }
 
 async function refreshDashboard() {
