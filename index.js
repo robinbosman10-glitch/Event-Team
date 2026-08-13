@@ -4,6 +4,7 @@ const {
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  SlashCommandBuilder,
 } = require("discord.js");
 
 process.env.TZ = "Europe/Amsterdam";
@@ -12,6 +13,8 @@ const CONFIG = Object.freeze({
   attendanceChannelId: "1438602360095113390",
   overviewChannelId: "1537247199606608013",
   inactivityChannelId: "1537255726735691786",
+  absenceChannelId: "1509628813628280842",
+  absenceCommandRoleId: "1218521637368893471",
   excludedUserIds: ["683032015045787676"],
   attendanceExemptRoleIds: [
     "1218521637368893471",
@@ -36,7 +39,53 @@ const CONFIG = Object.freeze({
   updateIntervalMs: 5 * 60 * 1000,
   attendanceDashboardMarker: "AFR-WEEKOVERZICHT",
   inactivityDashboardMarker: "AFR-INACTIVITEIT",
+  manualAbsenceMarker: "AFR-HANDMATIG-AFWEZIG",
+  removedAbsenceMarker: "AFR-AFWEZIG-VERWIJDERD",
 });
+
+const absenceCommand = new SlashCommandBuilder()
+  .setName("afwezig")
+  .setDescription("Beheer handmatige afwezigheden.")
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("toevoegen")
+      .setDescription("Voeg iemand handmatig aan de afwezigheidslijst toe.")
+      .addUserOption((option) =>
+        option
+          .setName("persoon")
+          .setDescription("De persoon die afwezig is.")
+          .setRequired(true),
+      )
+      .addStringOption((option) =>
+        option
+          .setName("begin")
+          .setDescription("Begindatum en -tijd: DD-MM-JJJJ UU:MM")
+          .setRequired(true),
+      )
+      .addStringOption((option) =>
+        option
+          .setName("einde")
+          .setDescription("Einddatum en -tijd: DD-MM-JJJJ UU:MM")
+          .setRequired(true),
+      )
+      .addStringOption((option) =>
+        option
+          .setName("reden")
+          .setDescription("De reden van de afwezigheid.")
+          .setRequired(false),
+      ),
+  )
+  .addSubcommand((subcommand) =>
+    subcommand
+      .setName("verwijderen")
+      .setDescription("Haal iemand handmatig uit de afwezigheidslijst.")
+      .addUserOption((option) =>
+        option
+          .setName("persoon")
+          .setDescription("De persoon die uit de afwezigheidslijst moet.")
+          .setRequired(true),
+      ),
+  );
 
 const client = new Client({
   intents: [
@@ -84,6 +133,62 @@ function addLocalDays(date, days) {
   return result;
 }
 
+function parseDutchDateTime(dateText, timeText, useEndOfDay = false) {
+  const dateMatch = String(dateText || "").match(
+    /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/,
+  );
+
+  if (!dateMatch) return null;
+
+  const [, dayText, monthText, yearText] = dateMatch;
+  const timeMatch = String(timeText || "").match(/^(\d{1,2}):(\d{2})$/);
+  const day = Number(dayText);
+  const month = Number(monthText);
+  const year = Number(yearText);
+  const hour = timeMatch ? Number(timeMatch[1]) : useEndOfDay ? 23 : 0;
+  const minute = timeMatch ? Number(timeMatch[2]) : useEndOfDay ? 59 : 0;
+
+  if (hour > 23 || minute > 59) return null;
+
+  const result = new Date(year, month - 1, day, hour, minute, 0, 0);
+
+  if (
+    result.getFullYear() !== year ||
+    result.getMonth() !== month - 1 ||
+    result.getDate() !== day
+  ) {
+    return null;
+  }
+
+  return result;
+}
+
+function parseCommandDateTime(value) {
+  const match = String(value || "")
+    .trim()
+    .match(/^(\d{1,2}[/-]\d{1,2}[/-]\d{4})\s+(\d{1,2}:\d{2})$/);
+
+  return match ? parseDutchDateTime(match[1], match[2]) : null;
+}
+
+function formatLocalDate(date) {
+  return new Intl.DateTimeFormat("nl-NL", {
+    timeZone: CONFIG.timeZone,
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  }).format(date);
+}
+
+function formatLocalTime(date) {
+  return new Intl.DateTimeFormat("nl-NL", {
+    timeZone: CONFIG.timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
 function getMissedDays(lastActivityTimestamp, trackingStart, now = new Date()) {
   const current = new Date(now);
   const hasActivity = Number.isFinite(lastActivityTimestamp);
@@ -113,6 +218,109 @@ function getMentionedUserIds(content) {
   return new Set(
     [...content.matchAll(/<@!?(\d{17,20})>/g)].map((match) => match[1]),
   );
+}
+
+function getMessageText(message) {
+  const embedText = message.embeds.flatMap((embed) => [
+    embed.title,
+    embed.description,
+    ...(embed.fields || []).flatMap((field) => [field.name, field.value]),
+    embed.footer?.text,
+  ]);
+
+  return [message.content, ...embedText]
+    .filter(Boolean)
+    .join("\n")
+    .replace(/\*\*/g, "");
+}
+
+function getMarkedUserId(message, marker) {
+  const markerPattern = new RegExp(`${marker}:(\\d{17,20})`, "i");
+  return getMessageText(message).match(markerPattern)?.[1] || null;
+}
+
+function getFormValue(text, label) {
+  const pattern = new RegExp(
+    `(?:^|\\n)\\s*[>|]?\\s*${label}:\\s*([^\\n]+)`,
+    "i",
+  );
+  return text.match(pattern)?.[1]?.trim() || "";
+}
+
+function parseAbsenceForm(message) {
+  const text = getMessageText(message);
+  const userId = getFormValue(text, "Naam").match(/<@!?(\d{17,20})>/)?.[1];
+  const beginDateText = getFormValue(text, "Begin datum");
+  const endDateText = getFormValue(text, "Eind datum");
+
+  if (!userId || !beginDateText || !endDateText) return null;
+
+  const beginTimeText =
+    getFormValue(text, "Begin tijd") || beginDateText.match(/\d{1,2}:\d{2}/)?.[0];
+  const endTimeText =
+    getFormValue(text, "Eind tijd") || endDateText.match(/\d{1,2}:\d{2}/)?.[0];
+  const beginDateOnly = beginDateText.match(/\d{1,2}[/-]\d{1,2}[/-]\d{4}/)?.[0];
+  const endDateOnly = endDateText.match(/\d{1,2}[/-]\d{1,2}[/-]\d{4}/)?.[0];
+  const start = parseDutchDateTime(beginDateOnly, beginTimeText, false);
+  const end = parseDutchDateTime(endDateOnly, endTimeText, true);
+
+  if (!start || !end || end < start) return null;
+
+  return {
+    userId,
+    reason: getFormValue(text, "Reden") || "Geen reden opgegeven",
+    start,
+    end,
+    sourceTimestamp: message.createdTimestamp,
+    cancelled: false,
+  };
+}
+
+function collectAbsenceRecords(messages, allowedMemberIds, monthStart) {
+  const records = [];
+  const orderedMessages = [...messages].sort(
+    (messageA, messageB) =>
+      messageA.createdTimestamp - messageB.createdTimestamp,
+  );
+
+  for (const message of orderedMessages) {
+    const removedUserId = getMarkedUserId(
+      message,
+      CONFIG.removedAbsenceMarker,
+    );
+
+    if (removedUserId) {
+      for (const record of records) {
+        if (record.userId === removedUserId) record.cancelled = true;
+      }
+      continue;
+    }
+
+    const record = parseAbsenceForm(message);
+
+    if (record && allowedMemberIds.has(record.userId)) records.push(record);
+  }
+
+  const absencesByMember = new Map(
+    [...allowedMemberIds].map((memberId) => [memberId, []]),
+  );
+
+  for (const record of records) {
+    if (
+      !record.cancelled &&
+      (record.sourceTimestamp >= monthStart.getTime() || record.end >= monthStart)
+    ) {
+      absencesByMember.get(record.userId).push(record);
+    }
+  }
+
+  for (const memberAbsences of absencesByMember.values()) {
+    memberAbsences.sort((absenceA, absenceB) =>
+      absenceB.start - absenceA.start,
+    );
+  }
+
+  return absencesByMember;
 }
 
 async function fetchMessagesSince(channel, startTimestamp) {
@@ -370,9 +578,30 @@ function getMemberInactivity(member, latestActivity, monthStart, now) {
   };
 }
 
-function formatInactivityMemberLine(member, inactivity) {
+function formatAbsenceRecord(record, now) {
+  const startAt = Math.floor(record.start.getTime() / 1_000);
+  const endAt = Math.floor(record.end.getTime() / 1_000);
+  const status =
+    now < record.start
+      ? "🗓️ Gepland"
+      : now <= record.end
+        ? "🛌 Nu afwezig"
+        : "⚪ Afgelopen";
+  const reason = record.reason.replace(/\s+/g, " ").slice(0, 120);
+
+  return `↳ ${status} · **Begin:** <t:${startAt}:f> · **Einde:** <t:${endAt}:f> · **Reden:** ${reason}`;
+}
+
+function formatInactivityMemberLine(member, inactivity, absences, now) {
+  const absenceLines = (absences.get(member.id) || []).map((record) =>
+    formatAbsenceRecord(record, now),
+  );
+
   if (CONFIG.attendanceExemptRoleIds.includes(getMemberRankId(member))) {
-    return `✨ <@${member.id}> — **Geen Inactiviteit bijhouden!**`;
+    return [
+      `✨ <@${member.id}> — **Geen Inactiviteit bijhouden!**`,
+      ...absenceLines,
+    ].join("\n");
   }
 
   const { lastActivityTimestamp, missedDays } = inactivity.get(member.id);
@@ -382,19 +611,26 @@ function formatInactivityMemberLine(member, inactivity) {
       ? ` · laatst meegedaan <t:${Math.floor(lastActivityTimestamp / 1_000)}:R>`
       : " · deze maand nog niet meegedaan";
 
-    return `🔴 <@${member.id}> — **${missedDays} dagen inactief**${lastSeenText}`;
+    return [
+      `🔴 <@${member.id}> — **${missedDays} dagen inactief**${lastSeenText}`,
+      ...absenceLines,
+    ].join("\n");
   }
 
   const lastSeenText = lastActivityTimestamp
     ? ` · laatst meegedaan <t:${Math.floor(lastActivityTimestamp / 1_000)}:R>`
     : " · deze maand nog niet meegedaan";
 
-  return `🟢 <@${member.id}> — **Actief** · ${missedDays}/2 gemiste dagen${lastSeenText}`;
+  return [
+    `🟢 <@${member.id}> — **Actief** · ${missedDays}/2 gemiste dagen${lastSeenText}`,
+    ...absenceLines,
+  ].join("\n");
 }
 
 function buildInactivityDashboardEmbeds(
   members,
   latestActivity,
+  absences,
   monthStart,
   messageCount,
   now = new Date(),
@@ -408,7 +644,8 @@ function buildInactivityDashboardEmbeds(
   );
   const lines = buildRankLines(
     allMembers,
-    (member) => formatInactivityMemberLine(member, inactivity),
+    (member) =>
+      formatInactivityMemberLine(member, inactivity, absences, now),
     (member) => inactivity.get(member.id).missedDays,
   );
   const chunks = chunkLines(lines);
@@ -419,6 +656,11 @@ function buildInactivityDashboardEmbeds(
   const exemptCount = allMembers.length - trackedMembers.length;
   const inactiveCount = trackedMembers.filter(
     (member) => inactivity.get(member.id).missedDays >= 2,
+  ).length;
+  const reportedAbsentCount = trackedMembers.filter((member) =>
+    (absences.get(member.id) || []).some(
+      (record) => record.start <= now && record.end >= now,
+    ),
   ).length;
   const updatedAt = Math.floor(now.getTime() / 1_000);
   const monthStartAt = Math.floor(monthStart.getTime() / 1_000);
@@ -432,6 +674,7 @@ function buildInactivityDashboardEmbeds(
           "Dit overzicht is gekoppeld aan dezelfde aanwezigheidsberichten. Een deelname zet de inactiviteit direct terug naar nul.",
           "",
           `**Inactief:** ${inactiveCount}/${trackedMembers.length}`,
+          `**Momenteel afwezig gemeld:** ${reportedAbsentCount} leden`,
           `**Geen inactiviteit bijhouden:** ${exemptCount} leden`,
           `**Meten vanaf:** <t:${monthStartAt}:D>`,
           `**Dagelijkse peiling:** 21:00 uur`,
@@ -503,11 +746,17 @@ async function refreshDashboard() {
   refreshInProgress = true;
 
   try {
-    const [attendanceChannel, overviewChannel, inactivityChannel] =
+    const [
+      attendanceChannel,
+      overviewChannel,
+      inactivityChannel,
+      absenceChannel,
+    ] =
       await Promise.all([
         client.channels.fetch(CONFIG.attendanceChannelId),
         client.channels.fetch(CONFIG.overviewChannelId),
         client.channels.fetch(CONFIG.inactivityChannelId),
+        client.channels.fetch(CONFIG.absenceChannelId),
       ]);
 
     if (!attendanceChannel?.isTextBased() || !attendanceChannel.messages) {
@@ -522,12 +771,17 @@ async function refreshDashboard() {
       throw new Error("Het inactiviteitskanaal is geen tekstkanaal.");
     }
 
+    if (!absenceChannel?.isTextBased() || !absenceChannel.messages) {
+      throw new Error("Het afwezigheidskanaal is geen tekstkanaal.");
+    }
+
     const guild = attendanceChannel.guild;
 
     if (
       !guild ||
       overviewChannel.guildId !== guild.id ||
-      inactivityChannel.guildId !== guild.id
+      inactivityChannel.guildId !== guild.id ||
+      absenceChannel.guildId !== guild.id
     ) {
       throw new Error("De kanalen moeten in dezelfde Discord-server staan.");
     }
@@ -543,8 +797,13 @@ async function refreshDashboard() {
     const now = new Date();
     const period = getWeekPeriod(now);
     const monthStart = getMonthStart(now);
+    const absenceScanStart = new Date(monthStart);
+    absenceScanStart.setMonth(absenceScanStart.getMonth() - 1);
     const scanStart = Math.min(period.start.getTime(), monthStart.getTime());
-    const messages = await fetchMessagesSince(attendanceChannel, scanStart);
+    const [messages, absenceMessages] = await Promise.all([
+      fetchMessagesSince(attendanceChannel, scanStart),
+      fetchMessagesSince(absenceChannel, absenceScanStart.getTime()),
+    ]);
     const weeklyMessages = messages.filter(
       (message) =>
         message.createdTimestamp >= period.start.getTime() &&
@@ -556,6 +815,11 @@ async function refreshDashboard() {
     const memberIds = new Set(members.keys());
     const attendance = collectAttendance(weeklyMessages, memberIds);
     const latestActivity = collectLatestActivity(monthlyMessages, memberIds);
+    const absences = collectAbsenceRecords(
+      absenceMessages,
+      memberIds,
+      monthStart,
+    );
     const attendanceEmbeds = buildAttendanceDashboardEmbeds(
       members.values(),
       attendance,
@@ -565,8 +829,9 @@ async function refreshDashboard() {
     const inactivityEmbeds = buildInactivityDashboardEmbeds(
       members.values(),
       latestActivity,
+      absences,
       monthStart,
-      monthlyMessages.length,
+      absenceMessages.length,
       now,
     );
 
@@ -581,7 +846,7 @@ async function refreshDashboard() {
       CONFIG.inactivityDashboardMarker,
     );
     console.log(
-      `Dashboards bijgewerkt: ${members.size} leden, ${monthlyMessages.length} maandberichten.`,
+      `Dashboards bijgewerkt: ${members.size} leden, ${monthlyMessages.length} aanwezigheidsberichten en ${absenceMessages.length} afwezigheidsberichten.`,
     );
   } catch (error) {
     console.error("De dashboards konden niet worden bijgewerkt:", error);
@@ -600,20 +865,189 @@ function scheduleDashboardUpdates() {
   }, delayUntilNextUpdate);
 }
 
+async function registerAbsenceCommand(guild) {
+  const commands = await guild.commands.fetch();
+  const existingCommand = commands.find(
+    (command) => command.name === absenceCommand.name,
+  );
+  const commandData = absenceCommand.toJSON();
+
+  if (existingCommand) {
+    await existingCommand.edit(commandData);
+  } else {
+    await guild.commands.create(commandData);
+  }
+
+  console.log("Slash-command /afwezig is geregistreerd.");
+}
+
+async function getTrackedTargetMember(interaction) {
+  const user = interaction.options.getUser("persoon", true);
+  const member = await interaction.guild.members.fetch(user.id);
+
+  if (
+    user.bot ||
+    CONFIG.excludedUserIds.includes(user.id) ||
+    !CONFIG.rankRoleIds.some((roleId) => member.roles.cache.has(roleId))
+  ) {
+    throw new Error("Deze persoon staat niet in de gekoppelde rollenlijst.");
+  }
+
+  return member;
+}
+
+async function handleAbsenceCommand(interaction) {
+  if (
+    !interaction.isChatInputCommand() ||
+    interaction.commandName !== absenceCommand.name
+  ) {
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  try {
+    if (!interaction.inGuild()) {
+      throw new Error("Deze command werkt alleen in de Discord-server.");
+    }
+
+    const executor = await interaction.guild.members.fetch(interaction.user.id);
+
+    if (!executor.roles.cache.has(CONFIG.absenceCommandRoleId)) {
+      throw new Error(
+        `Alleen leden met <@&${CONFIG.absenceCommandRoleId}> mogen deze command gebruiken.`,
+      );
+    }
+
+    const targetMember = await getTrackedTargetMember(interaction);
+    const absenceChannel = await client.channels.fetch(CONFIG.absenceChannelId);
+
+    if (!absenceChannel?.isTextBased() || !absenceChannel.messages) {
+      throw new Error("Het afwezigheidskanaal is geen tekstkanaal.");
+    }
+
+    const subcommand = interaction.options.getSubcommand();
+
+    if (subcommand === "toevoegen") {
+      const start = parseCommandDateTime(
+        interaction.options.getString("begin", true),
+      );
+      const end = parseCommandDateTime(
+        interaction.options.getString("einde", true),
+      );
+
+      if (!start || !end) {
+        throw new Error(
+          "Gebruik voor begin en einde het formaat `DD-MM-JJJJ UU:MM`.",
+        );
+      }
+
+      if (end <= start) {
+        throw new Error("De einddatum en -tijd moeten na het begin liggen.");
+      }
+
+      const reason =
+        interaction.options.getString("reden")?.trim() ||
+        "Geen reden opgegeven";
+      const formEmbed = new EmbedBuilder()
+        .setColor(0x9b59b6)
+        .setTitle("| Afmeldingsformulier")
+        .setDescription(
+          [
+            `> **Naam:** <@${targetMember.id}>`,
+            `> **Reden:** ${reason.slice(0, 500)}`,
+            `> **Begin datum:** ${formatLocalDate(start)}`,
+            `> **Begin tijd:** ${formatLocalTime(start)}`,
+            `> **Eind datum:** ${formatLocalDate(end)}`,
+            `> **Eind tijd:** ${formatLocalTime(end)}`,
+            `> **Tag:** <@${interaction.user.id}>`,
+          ].join("\n"),
+        )
+        .setFooter({
+          text: `${CONFIG.manualAbsenceMarker}:${targetMember.id}`,
+        })
+        .setTimestamp();
+
+      await absenceChannel.send({
+        embeds: [formEmbed],
+        allowedMentions: { parse: [] },
+      });
+      await refreshDashboard();
+      await interaction.editReply(
+        `De afwezigheid van <@${targetMember.id}> is toegevoegd van <t:${Math.floor(start.getTime() / 1_000)}:f> tot <t:${Math.floor(end.getTime() / 1_000)}:f>.`,
+      );
+      return;
+    }
+
+    const monthStart = getMonthStart();
+    const scanStart = new Date(monthStart);
+    scanStart.setMonth(scanStart.getMonth() - 1);
+    const sourceMessages = await fetchMessagesSince(
+      absenceChannel,
+      scanStart.getTime(),
+    );
+    const records = collectAbsenceRecords(
+      sourceMessages,
+      new Set([targetMember.id]),
+      monthStart,
+    ).get(targetMember.id);
+
+    if (!records?.length) {
+      throw new Error(
+        `Er staat geen afwezigheid van <@${targetMember.id}> in de live lijst.`,
+      );
+    }
+
+    const removalEmbed = new EmbedBuilder()
+      .setColor(0x57f287)
+      .setDescription(
+        `✅ <@${targetMember.id}> is handmatig uit de afwezigheidslijst gehaald door <@${interaction.user.id}>.`,
+      )
+      .setFooter({
+        text: `${CONFIG.removedAbsenceMarker}:${targetMember.id}`,
+      })
+      .setTimestamp();
+
+    await absenceChannel.send({
+      embeds: [removalEmbed],
+      allowedMentions: { parse: [] },
+    });
+    await refreshDashboard();
+    await interaction.editReply(
+      `<@${targetMember.id}> is uit de live afwezigheidslijst gehaald.`,
+    );
+  } catch (error) {
+    await interaction.editReply(`❌ ${error.message}`);
+  }
+}
+
+client.on(Events.InteractionCreate, (interaction) => {
+  void handleAbsenceCommand(interaction);
+});
+
 client.on(Events.MessageCreate, (message) => {
-  if (message.channelId === CONFIG.attendanceChannelId) {
+  if (
+    message.channelId === CONFIG.attendanceChannelId ||
+    message.channelId === CONFIG.absenceChannelId
+  ) {
     void refreshDashboard();
   }
 });
 
 client.on(Events.MessageUpdate, (_oldMessage, newMessage) => {
-  if (newMessage.channelId === CONFIG.attendanceChannelId) {
+  if (
+    newMessage.channelId === CONFIG.attendanceChannelId ||
+    newMessage.channelId === CONFIG.absenceChannelId
+  ) {
     void refreshDashboard();
   }
 });
 
 client.on(Events.MessageDelete, (message) => {
-  if (message.channelId === CONFIG.attendanceChannelId) {
+  if (
+    message.channelId === CONFIG.attendanceChannelId ||
+    message.channelId === CONFIG.absenceChannelId
+  ) {
     void refreshDashboard();
   }
 });
@@ -626,6 +1060,20 @@ client.once(Events.ClientReady, async (readyClient) => {
     console.log("De standaard profielfoto is ingesteld.");
   } catch (error) {
     console.error("De profielfoto kon niet worden ingesteld:", error);
+  }
+
+  try {
+    const attendanceChannel = await client.channels.fetch(
+      CONFIG.attendanceChannelId,
+    );
+
+    if (!attendanceChannel?.guild) {
+      throw new Error("De Discord-server kon niet worden gevonden.");
+    }
+
+    await registerAbsenceCommand(attendanceChannel.guild);
+  } catch (error) {
+    console.error("Slash-command /afwezig kon niet worden geregistreerd:", error);
   }
 
   await refreshDashboard();
@@ -644,10 +1092,13 @@ if (require.main === module) void startBot();
 
 module.exports = {
   collectAttendance,
+  collectAbsenceRecords,
   collectLatestActivity,
   getMissedDays,
   getMemberRankId,
   getMentionedUserIds,
   getMonthStart,
   getWeekPeriod,
+  parseAbsenceForm,
+  parseCommandDateTime,
 };
