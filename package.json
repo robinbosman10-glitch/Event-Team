@@ -2,7 +2,7 @@
   "name": "lege-discord-bot",
   "version": "1.0.0",
   "private": true,
-  "description": "Discord-bot met een automatisch wekelijks aanwezigheidsoverzicht.",
+  "description": "Discord-bot met live aanwezigheid, inactiviteit en afwezigheidsbeheer.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
