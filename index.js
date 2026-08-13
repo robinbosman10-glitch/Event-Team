@@ -1919,7 +1919,7 @@ async function handleUnbanCommand(interaction) {
     const userText = user ? `${user.tag} (\`${userId}\`)` : `\`${userId}\``;
     const unbanEmbed = new EmbedBuilder()
       .setColor(0x57f287)
-      .setTitle("🔓 Gebruiker gedeblokkeerd")
+      .setTitle("🔓 Gebruiker Unbanned")
       .setDescription(
         [
           `> **Gebruiker:** ${userText}`,
