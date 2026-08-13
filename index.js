@@ -11,7 +11,25 @@ process.env.TZ = "Europe/Amsterdam";
 const CONFIG = Object.freeze({
   attendanceChannelId: "1438602360095113390",
   overviewChannelId: "1537247199606608013",
-  memberRoleId: "1440057853044850780",
+  excludedUserIds: ["683032015045787676"],
+  attendanceExemptRoleIds: [
+    "1218521637368893471",
+    "1518661886579707974",
+    "1438207385587028119",
+  ],
+  rankRoleIds: [
+    "1218521637368893471",
+    "1518661886579707974",
+    "1438207385587028119",
+    "1492244526356758748",
+    "1469669109988987006",
+    "1503083088148697320",
+    "1437915250182848653",
+    "1453080104019427441",
+    "1503084773508124843",
+    "1218521533606137926",
+    "1440057853044850780",
+  ],
   timeZone: "Europe/Amsterdam",
   updateIntervalMs: 5 * 60 * 1000,
   dashboardMarker: "AFR-WEEKOVERZICHT",
@@ -125,6 +143,66 @@ function formatAttendanceDates(dateKeys) {
     .join(", ");
 }
 
+function getMemberRankId(member) {
+  return CONFIG.rankRoleIds.find((roleId) => member.roles.cache.has(roleId));
+}
+
+function formatMemberLine(member, attendance) {
+  if (CONFIG.attendanceExemptRoleIds.includes(getMemberRankId(member))) {
+    return `✨ <@${member.id}> — **Geen Aanwezigheid Nodig!**`;
+  }
+
+  const dates = attendance.get(member.id);
+  const count = dates.size;
+  const icon =
+    count >= 5 ? "👑" : count >= 3 ? "🟢" : count === 2 ? "🟠" : "🔴";
+  const dateText = count > 0 ? ` · ${formatAttendanceDates(dates)}` : "";
+
+  return `${icon} <@${member.id}> — **${count}/7 dagen**${dateText}`;
+}
+
+function buildRankLines(members, attendance) {
+  const groups = new Map(
+    CONFIG.rankRoleIds.map((roleId) => [roleId, []]),
+  );
+
+  for (const member of members) {
+    groups.get(getMemberRankId(member)).push(member);
+  }
+
+  const lines = [];
+
+  for (const [rankIndex, roleId] of CONFIG.rankRoleIds.entries()) {
+    const rankMembers = groups.get(roleId).sort((memberA, memberB) => {
+      if (CONFIG.attendanceExemptRoleIds.includes(roleId)) {
+        return memberA.displayName.localeCompare(memberB.displayName, "nl");
+      }
+
+      const countDifference =
+        attendance.get(memberB.id).size - attendance.get(memberA.id).size;
+
+      return (
+        countDifference ||
+        memberA.displayName.localeCompare(memberB.displayName, "nl")
+      );
+    });
+
+    if (lines.length > 0) lines.push("");
+    lines.push(`### ${rankIndex + 1}. <@&${roleId}>`);
+
+    if (rankMembers.length === 0) {
+      lines.push("*Geen leden met deze rang.*");
+      continue;
+    }
+
+    lines.push(
+      ...rankMembers.map((member) => formatMemberLine(member, attendance)),
+    );
+  }
+
+  return lines;
+}
+
 function chunkLines(lines, maximumLength = 3_500) {
   const chunks = [];
   let currentChunk = [];
@@ -150,27 +228,15 @@ function chunkLines(lines, maximumLength = 3_500) {
 }
 
 function buildDashboardEmbeds(members, attendance, period, messageCount) {
-  const sortedMembers = [...members].sort((memberA, memberB) => {
-    const countDifference =
-      attendance.get(memberB.id).size - attendance.get(memberA.id).size;
-
-    return (
-      countDifference ||
-      memberA.displayName.localeCompare(memberB.displayName, "nl")
-    );
-  });
-
-  const lines = sortedMembers.map((member) => {
-    const dates = attendance.get(member.id);
-    const count = dates.size;
-    const icon = count >= 5 ? "👑" : count >= 3 ? "🟢" : count === 2 ? "🟠" : "🔴";
-    const dateText = count > 0 ? ` · ${formatAttendanceDates(dates)}` : "";
-
-    return `${icon} <@${member.id}> — **${count}/7 dagen**${dateText}`;
-  });
-
+  const allMembers = [...members];
+  const lines = buildRankLines(allMembers, attendance);
   const chunks = chunkLines(lines);
-  const presentCount = sortedMembers.filter(
+  const attendanceRequiredMembers = allMembers.filter(
+    (member) =>
+      !CONFIG.attendanceExemptRoleIds.includes(getMemberRankId(member)),
+  );
+  const exemptCount = allMembers.length - attendanceRequiredMembers.length;
+  const presentCount = attendanceRequiredMembers.filter(
     (member) => attendance.get(member.id).size > 0,
   ).length;
   const updatedAt = Math.floor(Date.now() / 1_000);
@@ -182,9 +248,10 @@ function buildDashboardEmbeds(members, attendance, period, messageCount) {
     const isFirstPage = index === 0;
     const summary = isFirstPage
       ? [
-          `Alle leden met <@&${CONFIG.memberRoleId}> staan hieronder. Iedere persoon telt maximaal één keer per dag.`,
+          "Alle Event Team-leden staan hieronder op rang gesorteerd. Iemand met meerdere rangen staat alleen onder de hoogste rang. Iedere persoon telt maximaal één keer per dag.",
           "",
-          `**Aanwezig deze week:** ${presentCount}/${sortedMembers.length}`,
+          `**Aanwezig deze week:** ${presentCount}/${attendanceRequiredMembers.length}`,
+          `**Geen aanwezigheid nodig:** ${exemptCount} leden`,
           `**Periode:** <t:${startAt}:f> tot <t:${endAt}:f>`,
           `**Automatische reset:** <t:${endAt}:R>`,
           "",
@@ -283,7 +350,9 @@ async function refreshDashboard() {
 
     const members = guild.members.cache.filter(
       (member) =>
-        !member.user.bot && member.roles.cache.has(CONFIG.memberRoleId),
+        !member.user.bot &&
+        !CONFIG.excludedUserIds.includes(member.id) &&
+        CONFIG.rankRoleIds.some((roleId) => member.roles.cache.has(roleId)),
     );
     const period = getWeekPeriod();
     const messages = await fetchMessagesSince(
@@ -345,6 +414,7 @@ if (require.main === module) void startBot();
 
 module.exports = {
   collectAttendance,
+  getMemberRankId,
   getMentionedUserIds,
   getWeekPeriod,
 };
