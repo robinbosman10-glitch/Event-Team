@@ -592,10 +592,15 @@ function formatAbsenceRecord(record, now) {
   return `↳ ${status} · **Begin:** <t:${startAt}:f> · **Einde:** <t:${endAt}:f> · **Reden:** ${reason}`;
 }
 
+function getVisibleAbsenceRecords(records, now = new Date()) {
+  return records.filter((record) => record.end >= now);
+}
+
 function formatInactivityMemberLine(member, inactivity, absences, now) {
-  const absenceLines = (absences.get(member.id) || []).map((record) =>
-    formatAbsenceRecord(record, now),
-  );
+  const absenceLines = getVisibleAbsenceRecords(
+    absences.get(member.id) || [],
+    now,
+  ).map((record) => formatAbsenceRecord(record, now));
 
   if (CONFIG.attendanceExemptRoleIds.includes(getMemberRankId(member))) {
     return [
@@ -986,11 +991,13 @@ async function handleAbsenceCommand(interaction) {
       absenceChannel,
       scanStart.getTime(),
     );
-    const records = collectAbsenceRecords(
-      sourceMessages,
-      new Set([targetMember.id]),
-      monthStart,
-    ).get(targetMember.id);
+    const records = getVisibleAbsenceRecords(
+      collectAbsenceRecords(
+        sourceMessages,
+        new Set([targetMember.id]),
+        monthStart,
+      ).get(targetMember.id),
+    );
 
     if (!records?.length) {
       throw new Error(
@@ -1098,6 +1105,7 @@ module.exports = {
   getMemberRankId,
   getMentionedUserIds,
   getMonthStart,
+  getVisibleAbsenceRecords,
   getWeekPeriod,
   parseAbsenceForm,
   parseCommandDateTime,
