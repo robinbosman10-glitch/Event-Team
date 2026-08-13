@@ -154,6 +154,31 @@ const sheetTestCommand = new SlashCommandBuilder()
   .setDefaultMemberPermissions(0)
   .setDMPermission(false);
 
+const warningRemoveCommand = new SlashCommandBuilder()
+  .setName("warnweg")
+  .setDescription("Trek een waarschuwing en de bijbehorende sanctierol in.")
+  .setDefaultMemberPermissions(0)
+  .setDMPermission(false)
+  .addUserOption((option) =>
+    option
+      .setName("persoon")
+      .setDescription("De persoon van wie de waarschuwing wordt ingetrokken.")
+      .setRequired(true),
+  )
+  .addRoleOption((option) =>
+    option
+      .setName("sanctie")
+      .setDescription("De sanctierol die bij deze waarschuwing hoort.")
+      .setRequired(true),
+  )
+  .addStringOption((option) =>
+    option
+      .setName("reden")
+      .setDescription("Waarom de waarschuwing wordt ingetrokken.")
+      .setMaxLength(1000)
+      .setRequired(true),
+  );
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -1286,7 +1311,12 @@ function scheduleDashboardUpdates() {
 
 async function registerCommands(guild) {
   const commands = await guild.commands.fetch();
-  const commandBuilders = [absenceCommand, warningCommand, sheetTestCommand];
+  const commandBuilders = [
+    absenceCommand,
+    warningCommand,
+    warningRemoveCommand,
+    sheetTestCommand,
+  ];
 
   for (const commandBuilder of commandBuilders) {
     const existingCommand = commands.find(
@@ -1302,7 +1332,7 @@ async function registerCommands(guild) {
   }
 
   console.log(
-    "Slash-commands /afwezig, /warn en /sheettest zijn geregistreerd.",
+    "Slash-commands /afwezig, /warn, /warnweg en /sheettest zijn geregistreerd.",
   );
 }
 
@@ -1556,6 +1586,134 @@ async function handleWarningCommand(interaction) {
   }
 }
 
+async function handleWarningRemoveCommand(interaction) {
+  if (
+    !interaction.isChatInputCommand() ||
+    interaction.commandName !== warningRemoveCommand.name
+  ) {
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  try {
+    if (!interaction.inGuild()) {
+      throw new Error("Deze command werkt alleen in de Discord-server.");
+    }
+
+    const executor =
+      interaction.guild.members.cache.get(interaction.user.id) ??
+      (await interaction.guild.members.fetch(interaction.user.id));
+
+    if (!executor.roles.cache.has(CONFIG.absenceCommandRoleId)) {
+      throw new Error(
+        `Alleen leden met <@&${CONFIG.absenceCommandRoleId}> mogen deze command gebruiken.`,
+      );
+    }
+
+    const user = interaction.options.getUser("persoon", true);
+    const targetMember =
+      interaction.guild.members.cache.get(user.id) ??
+      (await interaction.guild.members.fetch(user.id));
+    const sanctionRole = interaction.options.getRole("sanctie", true);
+    const reason = cleanEmbedValue(
+      interaction.options.getString("reden", true),
+    );
+    const botMember = interaction.guild.members.me;
+
+    if (!botMember) {
+      throw new Error("De eigen botrol kon niet worden gevonden.");
+    }
+
+    if (
+      sanctionRole.id === interaction.guild.id ||
+      sanctionRole.managed ||
+      sanctionRole.position >= botMember.roles.highest.position
+    ) {
+      throw new Error(
+        "De sanctierol moet een normale rol onder de hoogste botrol zijn.",
+      );
+    }
+
+    if (!targetMember.roles.cache.has(sanctionRole.id)) {
+      throw new Error(
+        `<@${targetMember.id}> heeft de sanctierol <@&${sanctionRole.id}> niet.`,
+      );
+    }
+
+    const warningChannel = await client.channels.fetch(CONFIG.warningChannelId);
+
+    if (!warningChannel?.isTextBased() || !warningChannel.messages) {
+      throw new Error("Het waarschuwingenkanaal is geen tekstkanaal.");
+    }
+
+    if (warningChannel.guildId !== interaction.guildId) {
+      throw new Error("Het waarschuwingenkanaal staat niet in deze server.");
+    }
+
+    await targetMember.roles.remove(
+      sanctionRole,
+      `Waarschuwing ingetrokken door ${interaction.user.tag}: ${reason}`,
+    );
+
+    try {
+      const spreadsheetResult = await sendSpreadsheetEvent("warning_removed", {
+        discordId: targetMember.id,
+        name: targetMember.displayName,
+        sanctionRoleId: sanctionRole.id,
+        sanctionName: sanctionRole.name,
+        reason,
+        actorId: interaction.user.id,
+        actorName:
+          interaction.member?.displayName ||
+          interaction.user.globalName ||
+          interaction.user.username,
+        occurredAt: new Date().toISOString(),
+      });
+
+      if (!spreadsheetResult) {
+        throw new Error(
+          "SHEET_WEBHOOK_URL of SHEET_WEBHOOK_SECRET ontbreekt bij de hosting.",
+        );
+      }
+    } catch (error) {
+      await targetMember.roles
+        .add(
+          sanctionRole,
+          "Sanctierol hersteld omdat de spreadsheet niet kon worden bijgewerkt.",
+        )
+        .catch(() => undefined);
+      throw new Error(
+        `Spreadsheet kon niet worden bijgewerkt. De sanctierol is hersteld. ${error.message}`,
+      );
+    }
+
+    const removalEmbed = new EmbedBuilder()
+      .setColor(0x57f287)
+      .setTitle("Waarschuwing ingetrokken ✅")
+      .setDescription(
+        [
+          `> **Naam:** <@${targetMember.id}>`,
+          `> **Verwijderde sanctie:** <@&${sanctionRole.id}>`,
+          `> **Reden:** ${reason}`,
+          `> **Ingetrokken door:** <@${interaction.user.id}>`,
+        ].join("\n"),
+      )
+      .setTimestamp();
+
+    await warningChannel.send({
+      embeds: [removalEmbed],
+      allowedMentions: { parse: [] },
+    });
+
+    await interaction.editReply(
+      `✅ De waarschuwing van <@${targetMember.id}> is ingetrokken, <@&${sanctionRole.id}> is verwijderd en de spreadsheet is bijgewerkt.`,
+    );
+  } catch (error) {
+    await interaction.editReply(`❌ ${error.message}`);
+  }
+}
+
 async function getTrackedTargetMember(interaction) {
   const user = interaction.options.getUser("persoon", true);
   const member =
@@ -1709,6 +1867,8 @@ client.on(Events.InteractionCreate, (interaction) => {
     void handleAbsenceCommand(interaction);
   } else if (interaction.commandName === warningCommand.name) {
     void handleWarningCommand(interaction);
+  } else if (interaction.commandName === warningRemoveCommand.name) {
+    void handleWarningRemoveCommand(interaction);
   } else if (interaction.commandName === sheetTestCommand.name) {
     void handleSheetTestCommand(interaction);
   }
