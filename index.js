@@ -246,6 +246,7 @@ function buildDashboardEmbeds(members, attendance, period, messageCount) {
 
   return chunks.map((chunk, index) => {
     const isFirstPage = index === 0;
+    const isLastPage = index === chunks.length - 1;
     const summary = isFirstPage
       ? [
           "Alle Event Team-leden staan hieronder op rang gesorteerd. Iemand met meerdere rangen staat alleen onder de hoogste rang. Iedere persoon telt maximaal één keer per dag.",
@@ -264,20 +265,25 @@ function buildDashboardEmbeds(members, attendance, period, messageCount) {
         ]
       : [];
 
-    return new EmbedBuilder()
+    const embed = new EmbedBuilder()
       .setColor(0xd7ff00)
-      .setAuthor({ name: "Event Team", iconURL: avatarUrl })
-      .setTitle(
-        chunks.length === 1
-          ? "📋 Wekelijks aanwezigheidsoverzicht"
-          : `📋 Wekelijks aanwezigheidsoverzicht (${index + 1}/${chunks.length})`,
-      )
-      .setDescription([...summary, ...chunk].join("\n"))
-      .setThumbnail(avatarUrl)
-      .setFooter({
+      .setDescription([...summary, ...chunk].join("\n"));
+
+    if (isFirstPage) {
+      embed
+        .setAuthor({ name: "Event Team", iconURL: avatarUrl })
+        .setTitle("📋 Wekelijks aanwezigheidsoverzicht")
+        .setThumbnail(avatarUrl);
+    }
+
+    if (isLastPage) {
+      embed.setFooter({
         text: `${CONFIG.dashboardMarker} • ${messageCount} berichten verwerkt • iedere 5 minuten live bijgewerkt`,
-      })
-      .setTimestamp(updatedAt * 1_000);
+      });
+      embed.setTimestamp(updatedAt * 1_000);
+    }
+
+    return embed;
   });
 }
 
