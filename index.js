@@ -46,6 +46,8 @@ const CONFIG = Object.freeze({
 const absenceCommand = new SlashCommandBuilder()
   .setName("afwezig")
   .setDescription("Beheer handmatige afwezigheden.")
+  .setDefaultMemberPermissions(0)
+  .setDMPermission(false)
   .addSubcommand((subcommand) =>
     subcommand
       .setName("toevoegen")
