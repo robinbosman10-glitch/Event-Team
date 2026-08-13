@@ -201,6 +201,20 @@ const banCommand = new SlashCommandBuilder()
       .setRequired(true),
   );
 
+const unbanCommand = new SlashCommandBuilder()
+  .setName("unban")
+  .setDescription("Hef een ban op via de Discord-gebruikers-ID.")
+  .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers)
+  .setDMPermission(false)
+  .addStringOption((option) =>
+    option
+      .setName("userid")
+      .setDescription("De Discord-gebruikers-ID waarvan de ban wordt opgeheven.")
+      .setMinLength(17)
+      .setMaxLength(20)
+      .setRequired(true),
+  );
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -1338,6 +1352,7 @@ async function registerCommands(guild) {
     warningCommand,
     warningRemoveCommand,
     banCommand,
+    unbanCommand,
     sheetTestCommand,
   ];
 
@@ -1355,7 +1370,7 @@ async function registerCommands(guild) {
   }
 
   console.log(
-    "Slash-commands /afwezig, /warn, /warnweg, /ban en /sheettest zijn geregistreerd.",
+    "Slash-commands /afwezig, /warn, /warnweg, /ban, /unban en /sheettest zijn geregistreerd.",
   );
 }
 
@@ -1852,6 +1867,76 @@ async function handleBanCommand(interaction) {
   }
 }
 
+async function handleUnbanCommand(interaction) {
+  if (
+    !interaction.isChatInputCommand() ||
+    interaction.commandName !== unbanCommand.name
+  ) {
+    return;
+  }
+
+  if (
+    !interaction.inGuild() ||
+    !interaction.memberPermissions?.has(PermissionFlagsBits.BanMembers)
+  ) {
+    await interaction.reply({
+      content: `❌ <@${interaction.user.id}>, you can't use that.`,
+      ephemeral: true,
+      allowedMentions: { users: [interaction.user.id] },
+    });
+    return;
+  }
+
+  await interaction.deferReply();
+
+  try {
+    const userId = interaction.options.getString("userid", true).trim();
+
+    if (!/^\d{17,20}$/.test(userId)) {
+      throw new Error("Vul een geldige Discord-gebruikers-ID in.");
+    }
+
+    const botMember = interaction.guild.members.me;
+
+    if (!botMember?.permissions.has(PermissionFlagsBits.BanMembers)) {
+      throw new Error("De bot mist de machtiging `Leden verbannen`.");
+    }
+
+    const existingBan = await interaction.guild.bans
+      .fetch(userId)
+      .catch(() => null);
+
+    if (!existingBan) {
+      throw new Error("Deze gebruiker staat niet op de banlijst.");
+    }
+
+    const auditReason =
+      `Unban door ${interaction.user.tag} (${interaction.user.id})`.slice(0, 512);
+
+    await interaction.guild.members.unban(userId, auditReason);
+
+    const user = existingBan.user;
+    const userText = user ? `${user.tag} (\`${userId}\`)` : `\`${userId}\``;
+    const unbanEmbed = new EmbedBuilder()
+      .setColor(0x57f287)
+      .setTitle("🔓 Gebruiker gedeblokkeerd")
+      .setDescription(
+        [
+          `> **Gebruiker:** ${userText}`,
+          `> **Gedeblokkeerd door:** <@${interaction.user.id}>`,
+        ].join("\n"),
+      )
+      .setTimestamp();
+
+    await interaction.editReply({
+      embeds: [unbanEmbed],
+      allowedMentions: { parse: [] },
+    });
+  } catch (error) {
+    await interaction.editReply(`❌ Unban mislukt: ${error.message}`);
+  }
+}
+
 async function getTrackedTargetMember(interaction) {
   const user = interaction.options.getUser("persoon", true);
   const member =
@@ -2009,6 +2094,8 @@ client.on(Events.InteractionCreate, (interaction) => {
     void handleWarningRemoveCommand(interaction);
   } else if (interaction.commandName === banCommand.name) {
     void handleBanCommand(interaction);
+  } else if (interaction.commandName === unbanCommand.name) {
+    void handleUnbanCommand(interaction);
   } else if (interaction.commandName === sheetTestCommand.name) {
     void handleSheetTestCommand(interaction);
   }
