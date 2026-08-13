@@ -100,6 +100,33 @@ const client = new Client({
 
 const dashboardMessagesByMarker = new Map();
 let refreshInProgress = false;
+let dashboardGuildId = null;
+
+async function loadAllGuildMembers(guild) {
+  let after;
+  let fetchedCount = 0;
+
+  while (true) {
+    const members = await guild.members.list({
+      after,
+      limit: 1000,
+      cache: true,
+    });
+
+    fetchedCount += members.size;
+
+    if (members.size < 1000) break;
+
+    const lastMember = members.last();
+
+    if (!lastMember || lastMember.id === after) break;
+    after = lastMember.id;
+  }
+
+  console.log(
+    `Ledenlijst eenmalig geladen: ${guild.members.cache.size} leden in de cache (${fetchedCount} opgehaald).`,
+  );
+}
 
 function getWeekPeriod(now = new Date()) {
   const current = new Date(now);
@@ -191,7 +218,12 @@ function formatLocalTime(date) {
   }).format(date);
 }
 
-function getMissedDays(lastActivityTimestamp, trackingStart, now = new Date()) {
+function getInactivityDayCounts(
+  lastActivityTimestamp,
+  trackingStart,
+  now = new Date(),
+  absenceRecords = [],
+) {
   const current = new Date(now);
   const hasActivity = Number.isFinite(lastActivityTimestamp);
   const baseline = new Date(
@@ -206,14 +238,39 @@ function getMissedDays(lastActivityTimestamp, trackingStart, now = new Date()) {
   }
 
   let missedDays = 0;
+  let excusedDays = 0;
   let cutoff = firstCutoff;
 
   while (cutoff <= current) {
-    missedDays += 1;
+    const isExcused = absenceRecords.some(
+      (record) =>
+        !record.cancelled && record.start <= cutoff && record.end >= cutoff,
+    );
+
+    if (isExcused) {
+      excusedDays += 1;
+    } else {
+      missedDays += 1;
+    }
+
     cutoff = addLocalDays(cutoff, 1);
   }
 
-  return missedDays;
+  return { missedDays, excusedDays };
+}
+
+function getMissedDays(
+  lastActivityTimestamp,
+  trackingStart,
+  now = new Date(),
+  absenceRecords = [],
+) {
+  return getInactivityDayCounts(
+    lastActivityTimestamp,
+    trackingStart,
+    now,
+    absenceRecords,
+  ).missedDays;
 }
 
 function getMentionedUserIds(content) {
@@ -568,15 +625,28 @@ function buildAttendanceDashboardEmbeds(
   });
 }
 
-function getMemberInactivity(member, latestActivity, monthStart, now) {
+function getMemberInactivity(
+  member,
+  latestActivity,
+  absences,
+  monthStart,
+  now,
+) {
   const lastActivityTimestamp = latestActivity.get(member.id);
   const trackingStart = new Date(
     Math.max(monthStart.getTime(), member.joinedTimestamp || 0),
   );
+  const { missedDays, excusedDays } = getInactivityDayCounts(
+    lastActivityTimestamp,
+    trackingStart,
+    now,
+    absences.get(member.id) || [],
+  );
 
   return {
     lastActivityTimestamp,
-    missedDays: getMissedDays(lastActivityTimestamp, trackingStart, now),
+    missedDays,
+    excusedDays,
   };
 }
 
@@ -611,7 +681,11 @@ function formatInactivityMemberLine(member, inactivity, absences, now) {
     ].join("\n");
   }
 
-  const { lastActivityTimestamp, missedDays } = inactivity.get(member.id);
+  const { lastActivityTimestamp, missedDays, excusedDays } =
+    inactivity.get(member.id);
+  const excusedText = excusedDays
+    ? ` · ${excusedDays} ${excusedDays === 1 ? "afwezigheidsdag" : "afwezigheidsdagen"} niet meegeteld`
+    : "";
 
   if (missedDays >= 2) {
     const lastSeenText = lastActivityTimestamp
@@ -619,7 +693,7 @@ function formatInactivityMemberLine(member, inactivity, absences, now) {
       : " · deze maand nog niet meegedaan";
 
     return [
-      `🔴 <@${member.id}> — **${missedDays} dagen inactief**${lastSeenText}`,
+      `🔴 <@${member.id}> — **${missedDays} dagen inactief**${lastSeenText}${excusedText}`,
       ...absenceLines,
     ].join("\n");
   }
@@ -629,7 +703,7 @@ function formatInactivityMemberLine(member, inactivity, absences, now) {
     : " · deze maand nog niet meegedaan";
 
   return [
-    `🟢 <@${member.id}> — **Actief** · ${missedDays}/2 gemiste dagen${lastSeenText}`,
+    `🟢 <@${member.id}> — **Actief** · ${missedDays}/2 gemiste dagen${lastSeenText}${excusedText}`,
     ...absenceLines,
   ].join("\n");
 }
@@ -646,7 +720,7 @@ function buildInactivityDashboardEmbeds(
   const inactivity = new Map(
     allMembers.map((member) => [
       member.id,
-      getMemberInactivity(member, latestActivity, monthStart, now),
+      getMemberInactivity(member, latestActivity, absences, monthStart, now),
     ]),
   );
   const lines = buildRankLines(
@@ -679,6 +753,7 @@ function buildInactivityDashboardEmbeds(
     const summary = isFirstPage
       ? [
           "Dit overzicht is gekoppeld aan dezelfde aanwezigheidsberichten. Een deelname zet de inactiviteit direct terug naar nul.",
+          "Geregistreerde afwezigheids- en vakantiedagen tellen niet mee bij de dagelijkse peiling van 21:00 uur.",
           "",
           `**Inactief:** ${inactiveCount}/${trackedMembers.length}`,
           `**Momenteel afwezig gemeld:** ${reportedAbsentCount} leden`,
@@ -793,8 +868,6 @@ async function refreshDashboard() {
       throw new Error("De kanalen moeten in dezelfde Discord-server staan.");
     }
 
-    await guild.members.fetch();
-
     const members = guild.members.cache.filter(
       (member) =>
         !member.user.bot &&
@@ -890,7 +963,9 @@ async function registerAbsenceCommand(guild) {
 
 async function getTrackedTargetMember(interaction) {
   const user = interaction.options.getUser("persoon", true);
-  const member = await interaction.guild.members.fetch(user.id);
+  const member =
+    interaction.guild.members.cache.get(user.id) ??
+    (await interaction.guild.members.fetch(user.id));
 
   if (
     user.bot ||
@@ -918,7 +993,9 @@ async function handleAbsenceCommand(interaction) {
       throw new Error("Deze command werkt alleen in de Discord-server.");
     }
 
-    const executor = await interaction.guild.members.fetch(interaction.user.id);
+    const executor =
+      interaction.guild.members.cache.get(interaction.user.id) ??
+      (await interaction.guild.members.fetch(interaction.user.id));
 
     if (!executor.roles.cache.has(CONFIG.absenceCommandRoleId)) {
       throw new Error(
@@ -1061,6 +1138,22 @@ client.on(Events.MessageDelete, (message) => {
   }
 });
 
+client.on(Events.GuildMemberAdd, (member) => {
+  if (member.guild.id === dashboardGuildId) void refreshDashboard();
+});
+
+client.on(Events.GuildMemberRemove, (member) => {
+  if (member.guild.id === dashboardGuildId) void refreshDashboard();
+});
+
+client.on(Events.GuildMemberUpdate, (_oldMember, newMember) => {
+  if (newMember.guild.id === dashboardGuildId) void refreshDashboard();
+});
+
+client.on(Events.Error, (error) => {
+  console.error("Discord-clientfout:", error);
+});
+
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Bot is online als ${readyClient.user.tag}.`);
 
@@ -1071,6 +1164,8 @@ client.once(Events.ClientReady, async (readyClient) => {
     console.error("De profielfoto kon niet worden ingesteld:", error);
   }
 
+  let dashboardGuild;
+
   try {
     const attendanceChannel = await client.channels.fetch(
       CONFIG.attendanceChannelId,
@@ -1080,7 +1175,19 @@ client.once(Events.ClientReady, async (readyClient) => {
       throw new Error("De Discord-server kon niet worden gevonden.");
     }
 
-    await registerAbsenceCommand(attendanceChannel.guild);
+    dashboardGuild = attendanceChannel.guild;
+    dashboardGuildId = dashboardGuild.id;
+    await loadAllGuildMembers(dashboardGuild);
+  } catch (error) {
+    console.error("De ledenlijst kon niet worden geladen:", error);
+  }
+
+  try {
+    if (!dashboardGuild) {
+      throw new Error("De Discord-server kon niet worden gevonden.");
+    }
+
+    await registerAbsenceCommand(dashboardGuild);
   } catch (error) {
     console.error("Slash-command /afwezig kon niet worden geregistreerd:", error);
   }
@@ -1106,9 +1213,11 @@ module.exports = {
   getMissedDays,
   getMemberRankId,
   getMentionedUserIds,
+  getInactivityDayCounts,
   getMonthStart,
   getVisibleAbsenceRecords,
   getWeekPeriod,
+  loadAllGuildMembers,
   parseAbsenceForm,
   parseCommandDateTime,
 };
