@@ -227,6 +227,18 @@ const refreshActivityCommand = new SlashCommandBuilder()
   .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
   .setDMPermission(false);
 
+const resetInactivityCommand = new SlashCommandBuilder()
+  .setName("resetinactiviteit")
+  .setDescription("Laat alle inactiviteitstellingen vanaf nu opnieuw beginnen.")
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+  .setDMPermission(false);
+
+const resetActivityCommand = new SlashCommandBuilder()
+  .setName("resetactiviteit")
+  .setDescription("Laat alle activiteitstellingen vanaf nu opnieuw beginnen.")
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+  .setDMPermission(false);
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -237,6 +249,7 @@ const client = new Client({
 });
 
 const dashboardMessagesByMarker = new Map();
+const dashboardResetTimestamps = new Map();
 let refreshInProgress = false;
 let dashboardGuildId = null;
 let archiveTestSentThisSession = false;
@@ -838,6 +851,7 @@ function buildAttendanceDashboardEmbeds(
   messageCount,
   mode = "live",
   now = new Date(),
+  resetAt = null,
 ) {
   const allMembers = [...members];
   const lines = buildRankLines(
@@ -876,6 +890,11 @@ function buildAttendanceDashboardEmbeds(
           `**Aanwezig deze week:** ${presentCount}/${attendanceRequiredMembers.length}`,
           `**Geen aanwezigheid nodig:** ${exemptCount} leden`,
           `**Periode:** <t:${startAt}:f> tot <t:${endAt}:f>`,
+          ...(resetAt
+            ? [
+                `**Handmatig opnieuw gestart:** <t:${Math.floor(resetAt / 1_000)}:f>`,
+              ]
+            : []),
           isFixedOverview
             ? `**Vastgelegd:** <t:${updatedAt}:f>`
             : `**Automatische reset:** <t:${endAt}:R>`,
@@ -911,7 +930,7 @@ function buildAttendanceDashboardEmbeds(
         ? `${CONFIG.attendanceArchiveTestMarker} • testbericht • mag verwijderd worden`
         : isArchive
           ? `${CONFIG.attendanceArchiveMarker}:${getLocalDateKey(period.start)} • definitief opgeslagen • ${messageCount} berichten verwerkt`
-          : `${CONFIG.attendanceDashboardMarker} • ${messageCount} berichten verwerkt • iedere 5 minuten live bijgewerkt`;
+          : `${CONFIG.attendanceDashboardMarker} • ${messageCount} berichten verwerkt • iedere 5 minuten live bijgewerkt${resetAt ? ` • reset:${resetAt}` : ""}`;
 
       embed.setFooter({
         text: footerText,
@@ -966,7 +985,13 @@ function getVisibleAbsenceRecords(records, now = new Date()) {
   return records.filter((record) => record.end >= now);
 }
 
-function formatInactivityMemberLine(member, inactivity, absences, now) {
+function formatInactivityMemberLine(
+  member,
+  inactivity,
+  absences,
+  now,
+  resetAt = null,
+) {
   const absenceLines = getVisibleAbsenceRecords(
     absences.get(member.id) || [],
     now,
@@ -988,7 +1013,9 @@ function formatInactivityMemberLine(member, inactivity, absences, now) {
   if (missedDays >= 2) {
     const lastSeenText = lastActivityTimestamp
       ? ` · laatst meegedaan <t:${Math.floor(lastActivityTimestamp / 1_000)}:R>`
-      : " · deze maand nog niet meegedaan";
+      : resetAt
+        ? " · sinds de laatste reset nog niet meegedaan"
+        : " · deze maand nog niet meegedaan";
 
     return [
       `🔴 <@${member.id}> — **${missedDays} dagen inactief**${lastSeenText}${excusedText}`,
@@ -998,7 +1025,9 @@ function formatInactivityMemberLine(member, inactivity, absences, now) {
 
   const lastSeenText = lastActivityTimestamp
     ? ` · laatst meegedaan <t:${Math.floor(lastActivityTimestamp / 1_000)}:R>`
-    : " · deze maand nog niet meegedaan";
+    : resetAt
+      ? " · sinds de laatste reset nog niet meegedaan"
+      : " · deze maand nog niet meegedaan";
 
   return [
     `🟢 <@${member.id}> — **Actief** · ${missedDays}/2 gemiste dagen${lastSeenText}${excusedText}`,
@@ -1010,21 +1039,22 @@ function buildInactivityDashboardEmbeds(
   members,
   latestActivity,
   absences,
-  monthStart,
+  trackingStart,
   messageCount,
   now = new Date(),
+  resetAt = null,
 ) {
   const allMembers = [...members];
   const inactivity = new Map(
     allMembers.map((member) => [
       member.id,
-      getMemberInactivity(member, latestActivity, absences, monthStart, now),
+      getMemberInactivity(member, latestActivity, absences, trackingStart, now),
     ]),
   );
   const lines = buildRankLines(
     allMembers,
     (member) =>
-      formatInactivityMemberLine(member, inactivity, absences, now),
+      formatInactivityMemberLine(member, inactivity, absences, now, resetAt),
     (member) => inactivity.get(member.id).missedDays,
   );
   const chunks = chunkLines(lines);
@@ -1042,7 +1072,7 @@ function buildInactivityDashboardEmbeds(
     ),
   ).length;
   const updatedAt = Math.floor(now.getTime() / 1_000);
-  const monthStartAt = Math.floor(monthStart.getTime() / 1_000);
+  const trackingStartAt = Math.floor(trackingStart.getTime() / 1_000);
   const avatarUrl = client.user.displayAvatarURL({ size: 256 });
 
   return chunks.map((chunk, index) => {
@@ -1056,7 +1086,12 @@ function buildInactivityDashboardEmbeds(
           `**Inactief:** ${inactiveCount}/${trackedMembers.length}`,
           `**Momenteel afwezig gemeld:** ${reportedAbsentCount} leden`,
           `**Geen inactiviteit bijhouden:** ${exemptCount} leden`,
-          `**Meten vanaf:** <t:${monthStartAt}:D>`,
+          `**Meten vanaf:** <t:${trackingStartAt}:f>`,
+          ...(resetAt
+            ? [
+                `**Handmatig opnieuw gestart:** <t:${Math.floor(resetAt / 1_000)}:f>`,
+              ]
+            : []),
           `**Dagelijkse peiling:** 21:00 uur`,
           "**Inactief vanaf:** 2 gemiste dagen achter elkaar",
           "",
@@ -1076,7 +1111,7 @@ function buildInactivityDashboardEmbeds(
 
     if (isLastPage) {
       embed.setFooter({
-        text: `${CONFIG.inactivityDashboardMarker} • ${messageCount} berichten verwerkt • iedere 5 minuten live bijgewerkt`,
+        text: `${CONFIG.inactivityDashboardMarker} • ${messageCount} berichten verwerkt • iedere 5 minuten live bijgewerkt${resetAt ? ` • reset:${resetAt}` : ""}`,
       });
       embed.setTimestamp(updatedAt * 1_000);
     }
@@ -1097,6 +1132,30 @@ async function findDashboardMessages(channel, marker) {
         ),
     )
     .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+}
+
+async function getDashboardResetTimestamp(channel, marker) {
+  if (dashboardResetTimestamps.has(marker)) {
+    return dashboardResetTimestamps.get(marker);
+  }
+
+  let dashboardMessages = dashboardMessagesByMarker.get(marker);
+
+  if (!dashboardMessages) {
+    dashboardMessages = await findDashboardMessages(channel, marker);
+    dashboardMessagesByMarker.set(marker, dashboardMessages);
+  }
+
+  const resetAt = dashboardMessages
+    .flatMap((message) => message.embeds)
+    .map((embed) => embed.footer?.text?.match(/(?:^| • )reset:(\d{10,13})(?:$| • )/)?.[1])
+    .filter(Boolean)
+    .map(Number)
+    .filter(Number.isFinite)
+    .at(-1) ?? null;
+
+  dashboardResetTimestamps.set(marker, resetAt);
+  return resetAt;
 }
 
 async function publishDashboard(channel, embeds, marker) {
@@ -1252,10 +1311,47 @@ async function refreshDashboard(scope = "both") {
     );
     const now = new Date();
     const period = getWeekPeriod(now);
+    const monthStart = getMonthStart(now);
+    const [storedAttendanceResetAt, storedInactivityResetAt] =
+      await Promise.all([
+        getDashboardResetTimestamp(
+          overviewChannel,
+          CONFIG.attendanceDashboardMarker,
+        ),
+        getDashboardResetTimestamp(
+          inactivityChannel,
+          CONFIG.inactivityDashboardMarker,
+        ),
+      ]);
+    const attendanceResetAt =
+      storedAttendanceResetAt >= period.start.getTime() &&
+      storedAttendanceResetAt <= now.getTime()
+        ? storedAttendanceResetAt
+        : null;
+    const inactivityResetAt =
+      storedInactivityResetAt >= monthStart.getTime() &&
+      storedInactivityResetAt <= now.getTime()
+        ? storedInactivityResetAt
+        : null;
+
+    dashboardResetTimestamps.set(
+      CONFIG.attendanceDashboardMarker,
+      attendanceResetAt,
+    );
+    dashboardResetTimestamps.set(
+      CONFIG.inactivityDashboardMarker,
+      inactivityResetAt,
+    );
+
+    const attendanceStart = new Date(
+      Math.max(period.start.getTime(), attendanceResetAt || 0),
+    );
+    const inactivityTrackingStart = new Date(
+      Math.max(monthStart.getTime(), inactivityResetAt || 0),
+    );
     const archivePeriod = isWeeklyArchiveTime(now)
       ? getMostRecentCompletedWeek(now)
       : null;
-    const monthStart = getMonthStart(now);
     const absenceScanStart = new Date(monthStart);
     absenceScanStart.setMonth(absenceScanStart.getMonth() - 1);
     const scanStart = Math.min(
@@ -1269,11 +1365,12 @@ async function refreshDashboard(scope = "both") {
     ]);
     const weeklyMessages = messages.filter(
       (message) =>
-        message.createdTimestamp >= period.start.getTime() &&
+        message.createdTimestamp >= attendanceStart.getTime() &&
         message.createdTimestamp < period.end.getTime(),
     );
     const monthlyMessages = messages.filter(
-      (message) => message.createdTimestamp >= monthStart.getTime(),
+      (message) =>
+        message.createdTimestamp >= inactivityTrackingStart.getTime(),
     );
     const memberIds = new Set(members.keys());
     const attendance = collectAttendance(weeklyMessages, memberIds);
@@ -1287,10 +1384,11 @@ async function refreshDashboard(scope = "both") {
       ? buildAttendanceDashboardEmbeds(
           members.values(),
           attendance,
-          period,
+          { ...period, start: attendanceStart },
           weeklyMessages.length,
           "live",
           now,
+          attendanceResetAt,
         )
       : null;
     const inactivityEmbeds = updateInactivity
@@ -1298,9 +1396,10 @@ async function refreshDashboard(scope = "both") {
           members.values(),
           latestActivity,
           absences,
-          monthStart,
+          inactivityTrackingStart,
           absenceMessages.length,
           now,
+          inactivityResetAt,
         )
       : null;
 
@@ -1390,6 +1489,8 @@ async function registerCommands(guild) {
     unbanCommand,
     refreshInactivityCommand,
     refreshActivityCommand,
+    resetInactivityCommand,
+    resetActivityCommand,
     sheetTestCommand,
   ];
 
@@ -1407,7 +1508,7 @@ async function registerCommands(guild) {
   }
 
   console.log(
-    "Slash-commands /afwezig, /warn, /warnweg, /ban, /unban, /werkbijinactiviteit, /werkbijactiviteit en /sheettest zijn geregistreerd.",
+    "Slash-commands /afwezig, /warn, /warnweg, /ban, /unban, /werkbijinactiviteit, /werkbijactiviteit, /resetinactiviteit, /resetactiviteit en /sheettest zijn geregistreerd.",
   );
 }
 
@@ -2026,6 +2127,75 @@ async function handleDashboardRefreshCommand(interaction) {
   );
 }
 
+async function handleDashboardResetCommand(interaction) {
+  if (
+    !interaction.isChatInputCommand() ||
+    ![
+      resetInactivityCommand.name,
+      resetActivityCommand.name,
+    ].includes(interaction.commandName)
+  ) {
+    return;
+  }
+
+  if (
+    !interaction.inGuild() ||
+    !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+  ) {
+    await interaction.reply({
+      content: `❌ <@${interaction.user.id}>, you can't use that.`,
+      ephemeral: true,
+      allowedMentions: { users: [interaction.user.id] },
+    });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  if (refreshInProgress) {
+    await interaction.editReply(
+      "⏳ De live overzichten worden al bijgewerkt. Probeer de reset over enkele seconden opnieuw.",
+    );
+    return;
+  }
+
+  const isInactivity =
+    interaction.commandName === resetInactivityCommand.name;
+  const scope = isInactivity ? "inactivity" : "attendance";
+  const marker = isInactivity
+    ? CONFIG.inactivityDashboardMarker
+    : CONFIG.attendanceDashboardMarker;
+  const overviewName = isInactivity
+    ? "inactiviteitsoverzicht"
+    : "activiteitsoverzicht";
+  const hadPreviousReset = dashboardResetTimestamps.has(marker);
+  const previousResetAt = dashboardResetTimestamps.get(marker);
+  const resetAt = Date.now();
+
+  dashboardResetTimestamps.set(marker, resetAt);
+  const result = await refreshDashboard(scope);
+
+  if (!result.ok) {
+    if (hadPreviousReset) {
+      dashboardResetTimestamps.set(marker, previousResetAt);
+    } else {
+      dashboardResetTimestamps.delete(marker);
+    }
+
+    const errorText = result.busy
+      ? "de overzichten worden al bijgewerkt"
+      : result.error?.message || "onbekende fout";
+    await interaction.editReply(
+      `❌ Het ${overviewName} kon niet worden gereset: ${errorText}.`,
+    );
+    return;
+  }
+
+  await interaction.editReply(
+    `✅ Het live ${overviewName} is gereset. Alle leden beginnen vanaf nu opnieuw; bestaande Discord-berichten zijn bewaard.`,
+  );
+}
+
 async function getTrackedTargetMember(interaction) {
   const user = interaction.options.getUser("persoon", true);
   const member =
@@ -2190,6 +2360,11 @@ client.on(Events.InteractionCreate, (interaction) => {
     interaction.commandName === refreshActivityCommand.name
   ) {
     void handleDashboardRefreshCommand(interaction);
+  } else if (
+    interaction.commandName === resetInactivityCommand.name ||
+    interaction.commandName === resetActivityCommand.name
+  ) {
+    void handleDashboardResetCommand(interaction);
   } else if (interaction.commandName === sheetTestCommand.name) {
     void handleSheetTestCommand(interaction);
   }
