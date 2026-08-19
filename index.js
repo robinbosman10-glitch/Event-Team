@@ -215,6 +215,18 @@ const unbanCommand = new SlashCommandBuilder()
       .setRequired(true),
   );
 
+const refreshInactivityCommand = new SlashCommandBuilder()
+  .setName("werkbijinactiviteit")
+  .setDescription("Werk het live inactiviteitsoverzicht direct bij.")
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+  .setDMPermission(false);
+
+const refreshActivityCommand = new SlashCommandBuilder()
+  .setName("werkbijactiviteit")
+  .setDescription("Werk het live activiteitsoverzicht direct bij.")
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+  .setDMPermission(false);
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -1177,9 +1189,12 @@ async function publishAttendanceArchiveTest(
   return true;
 }
 
-async function refreshDashboard() {
-  if (refreshInProgress) return;
+async function refreshDashboard(scope = "both") {
+  if (refreshInProgress) return { ok: false, busy: true };
   refreshInProgress = true;
+
+  const updateAttendance = scope === "both" || scope === "attendance";
+  const updateInactivity = scope === "both" || scope === "inactivity";
 
   try {
     const [
@@ -1268,33 +1283,39 @@ async function refreshDashboard() {
       memberIds,
       monthStart,
     );
-    const attendanceEmbeds = buildAttendanceDashboardEmbeds(
-      members.values(),
-      attendance,
-      period,
-      weeklyMessages.length,
-      "live",
-      now,
-    );
-    const inactivityEmbeds = buildInactivityDashboardEmbeds(
-      members.values(),
-      latestActivity,
-      absences,
-      monthStart,
-      absenceMessages.length,
-      now,
-    );
+    const attendanceEmbeds = updateAttendance
+      ? buildAttendanceDashboardEmbeds(
+          members.values(),
+          attendance,
+          period,
+          weeklyMessages.length,
+          "live",
+          now,
+        )
+      : null;
+    const inactivityEmbeds = updateInactivity
+      ? buildInactivityDashboardEmbeds(
+          members.values(),
+          latestActivity,
+          absences,
+          monthStart,
+          absenceMessages.length,
+          now,
+        )
+      : null;
 
-    await publishAttendanceArchiveTest(
-      archiveChannel,
-      members.values(),
-      attendance,
-      period,
-      weeklyMessages.length,
-      now,
-    );
+    if (scope === "both") {
+      await publishAttendanceArchiveTest(
+        archiveChannel,
+        members.values(),
+        attendance,
+        period,
+        weeklyMessages.length,
+        now,
+      );
+    }
 
-    if (archivePeriod) {
+    if (scope === "both" && archivePeriod) {
       const archiveMessages = messages.filter(
         (message) =>
           message.createdTimestamp >= archivePeriod.start.getTime() &&
@@ -1315,21 +1336,35 @@ async function refreshDashboard() {
       );
     }
 
-    await publishDashboard(
-      overviewChannel,
-      attendanceEmbeds,
-      CONFIG.attendanceDashboardMarker,
-    );
-    await publishDashboard(
-      inactivityChannel,
-      inactivityEmbeds,
-      CONFIG.inactivityDashboardMarker,
-    );
+    if (updateAttendance) {
+      await publishDashboard(
+        overviewChannel,
+        attendanceEmbeds,
+        CONFIG.attendanceDashboardMarker,
+      );
+    }
+
+    if (updateInactivity) {
+      await publishDashboard(
+        inactivityChannel,
+        inactivityEmbeds,
+        CONFIG.inactivityDashboardMarker,
+      );
+    }
+
+    const updatedOverview =
+      scope === "attendance"
+        ? "Activiteitsoverzicht"
+        : scope === "inactivity"
+          ? "Inactiviteitsoverzicht"
+          : "Activiteits- en inactiviteitsoverzicht";
     console.log(
-      `Dashboards bijgewerkt: ${members.size} leden, ${monthlyMessages.length} aanwezigheidsberichten en ${absenceMessages.length} afwezigheidsberichten.`,
+      `${updatedOverview} bijgewerkt: ${members.size} leden, ${monthlyMessages.length} aanwezigheidsberichten en ${absenceMessages.length} afwezigheidsberichten.`,
     );
+    return { ok: true };
   } catch (error) {
     console.error("De dashboards konden niet worden bijgewerkt:", error);
+    return { ok: false, error };
   } finally {
     refreshInProgress = false;
   }
@@ -1353,6 +1388,8 @@ async function registerCommands(guild) {
     warningRemoveCommand,
     banCommand,
     unbanCommand,
+    refreshInactivityCommand,
+    refreshActivityCommand,
     sheetTestCommand,
   ];
 
@@ -1370,7 +1407,7 @@ async function registerCommands(guild) {
   }
 
   console.log(
-    "Slash-commands /afwezig, /warn, /warnweg, /ban, /unban en /sheettest zijn geregistreerd.",
+    "Slash-commands /afwezig, /warn, /warnweg, /ban, /unban, /werkbijinactiviteit, /werkbijactiviteit en /sheettest zijn geregistreerd.",
   );
 }
 
@@ -1919,11 +1956,11 @@ async function handleUnbanCommand(interaction) {
     const userText = user ? `${user.tag} (\`${userId}\`)` : `\`${userId}\``;
     const unbanEmbed = new EmbedBuilder()
       .setColor(0x57f287)
-      .setTitle("🔓 Gebruiker Unbanned")
+      .setTitle("🔓 Gebruiker Geunbanned")
       .setDescription(
         [
           `> **Gebruiker:** ${userText}`,
-          `> **Gedeblokkeerd door:** <@${interaction.user.id}>`,
+          `> **Geunbanned door:** <@${interaction.user.id}>`,
         ].join("\n"),
       )
       .setTimestamp();
@@ -1935,6 +1972,58 @@ async function handleUnbanCommand(interaction) {
   } catch (error) {
     await interaction.editReply(`❌ Unban mislukt: ${error.message}`);
   }
+}
+
+async function handleDashboardRefreshCommand(interaction) {
+  if (
+    !interaction.isChatInputCommand() ||
+    ![
+      refreshInactivityCommand.name,
+      refreshActivityCommand.name,
+    ].includes(interaction.commandName)
+  ) {
+    return;
+  }
+
+  if (
+    !interaction.inGuild() ||
+    !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+  ) {
+    await interaction.reply({
+      content: `❌ <@${interaction.user.id}>, you can't use that.`,
+      ephemeral: true,
+      allowedMentions: { users: [interaction.user.id] },
+    });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const isInactivity =
+    interaction.commandName === refreshInactivityCommand.name;
+  const scope = isInactivity ? "inactivity" : "attendance";
+  const overviewName = isInactivity
+    ? "inactiviteitsoverzicht"
+    : "activiteitsoverzicht";
+  const result = await refreshDashboard(scope);
+
+  if (result.busy) {
+    await interaction.editReply(
+      `⏳ Het ${overviewName} wordt al bijgewerkt. Probeer het over enkele seconden opnieuw.`,
+    );
+    return;
+  }
+
+  if (!result.ok) {
+    await interaction.editReply(
+      `❌ Het ${overviewName} kon niet worden bijgewerkt: ${result.error?.message || "onbekende fout"}`,
+    );
+    return;
+  }
+
+  await interaction.editReply(
+    `✅ Het live ${overviewName} is opnieuw bijgewerkt. Er is niets gereset.`,
+  );
 }
 
 async function getTrackedTargetMember(interaction) {
@@ -2096,6 +2185,11 @@ client.on(Events.InteractionCreate, (interaction) => {
     void handleBanCommand(interaction);
   } else if (interaction.commandName === unbanCommand.name) {
     void handleUnbanCommand(interaction);
+  } else if (
+    interaction.commandName === refreshInactivityCommand.name ||
+    interaction.commandName === refreshActivityCommand.name
+  ) {
+    void handleDashboardRefreshCommand(interaction);
   } else if (interaction.commandName === sheetTestCommand.name) {
     void handleSheetTestCommand(interaction);
   }
