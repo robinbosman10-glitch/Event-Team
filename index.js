@@ -40,6 +40,7 @@ const CONFIG = Object.freeze({
     "1503084773508124843",
     "1218521533606137926",
     "1440057853044850780",
+    "1537250384572325889",
   ],
   timeZone: "Europe/Amsterdam",
   inactivityCutoffHour: 21,
