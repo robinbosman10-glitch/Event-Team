@@ -2632,7 +2632,9 @@ client.on(Events.MessageDelete, (message) => {
 });
 
 client.on(Events.GuildMemberAdd, (member) => {
-  if (member.guild.id === dashboardGuildId) void refreshDashboard();
+  if (member.guild.id !== dashboardGuildId) return;
+
+  void refreshDashboard();
 
   void restoreBlacklistRoles(member).catch((error) => {
     console.error(
