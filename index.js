@@ -18,6 +18,11 @@ const CONFIG = Object.freeze({
   absenceChannelId: "1509628813628280842",
   attendanceArchiveChannelId: "1537265369352372346",
   warningChannelId: "1440369548388732949",
+  blacklistRoleIds: [
+    "1542177617929703444",
+    "1461807420740341835",
+  ],
+  terminationPreservedRoleIds: ["1218323042204385310"],
   acceptedChannelId: "1449466069613019217",
   absenceCommandRoleId: "1218521637368893471",
   warningCommandRoleId: "1537254102529085480",
@@ -51,6 +56,7 @@ const CONFIG = Object.freeze({
   inactivityDashboardMarker: "AFR-INACTIVITEIT",
   manualAbsenceMarker: "AFR-HANDMATIG-AFWEZIG",
   removedAbsenceMarker: "AFR-AFWEZIG-VERWIJDERD",
+  blacklistMarker: "AFR-BLACKLIST",
 });
 
 const absenceCommand = new SlashCommandBuilder()
@@ -252,10 +258,12 @@ const client = new Client({
 
 const dashboardMessagesByMarker = new Map();
 const dashboardResetTimestamps = new Map();
+const blacklistUserIds = new Set();
 let refreshInProgress = false;
 let dashboardGuildId = null;
 let archiveTestSentThisSession = false;
 let spreadsheetConfigurationWarningShown = false;
+let blacklistLoadPromise = null;
 
 async function sendSpreadsheetEvent(type, data) {
   const webhookUrl = process.env.SHEET_WEBHOOK_URL;
@@ -523,6 +531,169 @@ function getMessageText(message) {
     .filter(Boolean)
     .join("\n")
     .replace(/\*\*/g, "");
+}
+
+function getBlacklistedUserId(message) {
+  for (const embed of message.embeds || []) {
+    const markerMatch = embed.footer?.text?.match(
+      new RegExp(`${CONFIG.blacklistMarker}:(\\d{17,20})`, "i"),
+    );
+
+    if (markerMatch) return markerMatch[1];
+
+    if (embed.title?.toLowerCase().startsWith("ontslagen")) {
+      const legacyMatch = embed.description?.match(
+        /(?:^|\n)>?\s*\*\*Naam:\*\*\s*(?:<@!?(\d{17,20})>|`?(\d{17,20})`?)/i,
+      );
+
+      if (legacyMatch) return legacyMatch[1] || legacyMatch[2];
+    }
+  }
+
+  return null;
+}
+
+async function getConfiguredBlacklistRoles(guild) {
+  const roles = await Promise.all(
+    CONFIG.blacklistRoleIds.map(
+      async (roleId) =>
+        guild.roles.cache.get(roleId) ??
+        (await guild.roles.fetch(roleId).catch(() => null)),
+    ),
+  );
+  const missingRoleIds = CONFIG.blacklistRoleIds.filter(
+    (_roleId, index) => !roles[index],
+  );
+
+  if (missingRoleIds.length > 0) {
+    throw new Error(
+      `Blacklistrol(len) niet gevonden: ${missingRoleIds.map((roleId) => `<@&${roleId}>`).join(", ")}.`,
+    );
+  }
+
+  const botMember = guild.members.me;
+
+  if (!botMember?.permissions.has(PermissionFlagsBits.ManageRoles)) {
+    throw new Error("De bot mist de machtiging `Rollen beheren`.");
+  }
+
+  const unmanageableRole = roles.find(
+    (role) =>
+      role.managed || role.position >= botMember.roles.highest.position,
+  );
+
+  if (unmanageableRole) {
+    throw new Error(
+      `De botrol moet boven blacklistrol <@&${unmanageableRole.id}> staan.`,
+    );
+  }
+
+  return roles;
+}
+
+async function loadBlacklistUserIds(guild) {
+  if (blacklistLoadPromise) return blacklistLoadPromise;
+
+  blacklistLoadPromise = (async () => {
+    const warningChannel = await client.channels.fetch(CONFIG.warningChannelId);
+
+    if (!warningChannel?.isTextBased() || !warningChannel.messages) {
+      throw new Error("Het waarschuwingenkanaal is geen tekstkanaal.");
+    }
+
+    if (warningChannel.guildId !== guild.id) {
+      throw new Error("Het waarschuwingenkanaal staat niet in deze server.");
+    }
+
+    let before;
+
+    while (true) {
+      const messages = await warningChannel.messages.fetch({
+        limit: 100,
+        ...(before ? { before } : {}),
+      });
+
+      for (const message of messages.values()) {
+        if (message.author.id !== client.user.id) continue;
+
+        const userId = getBlacklistedUserId(message);
+
+        if (userId) blacklistUserIds.add(userId);
+      }
+
+      if (messages.size < 100) break;
+
+      const oldestMessage = messages.last();
+
+      if (!oldestMessage || oldestMessage.id === before) break;
+      before = oldestMessage.id;
+    }
+
+    console.log(
+      `Blacklist geladen: ${blacklistUserIds.size} gebruiker(s) geregistreerd.`,
+    );
+    return blacklistUserIds;
+  })().catch((error) => {
+    blacklistLoadPromise = null;
+    throw error;
+  });
+
+  return blacklistLoadPromise;
+}
+
+async function restoreBlacklistRoles(member, configuredRoles = null) {
+  await loadBlacklistUserIds(member.guild);
+
+  if (!blacklistUserIds.has(member.id)) return false;
+
+  const blacklistRoles =
+    configuredRoles || (await getConfiguredBlacklistRoles(member.guild));
+  const missingRoles = blacklistRoles.filter(
+    (role) => !member.roles.cache.has(role.id),
+  );
+
+  if (missingRoles.length === 0) return false;
+
+  await member.roles.add(
+    missingRoles,
+    "Blacklistrollen automatisch hersteld na opnieuw joinen.",
+  );
+  console.log(
+    `Blacklistrollen hersteld voor ${member.user.tag} (${member.id}).`,
+  );
+  return true;
+}
+
+async function restoreBlacklistRolesForGuild(guild) {
+  await loadBlacklistUserIds(guild);
+
+  if (blacklistUserIds.size === 0) return;
+
+  const blacklistRoles = await getConfiguredBlacklistRoles(guild);
+  let restoredCount = 0;
+
+  for (const userId of blacklistUserIds) {
+    const member =
+      guild.members.cache.get(userId) ??
+      (await guild.members.fetch(userId).catch(() => null));
+
+    if (!member) continue;
+
+    try {
+      if (await restoreBlacklistRoles(member, blacklistRoles)) {
+        restoredCount += 1;
+      }
+    } catch (error) {
+      console.error(
+        `Blacklistrollen konden niet worden hersteld voor ${userId}:`,
+        error,
+      );
+    }
+  }
+
+  console.log(
+    `Blacklistcontrole voltooid: ${restoredCount} lid/leden bijgewerkt.`,
+  );
 }
 
 function getRoleSnapshot(member) {
@@ -1565,7 +1736,11 @@ async function handleSheetTestCommand(interaction) {
   }
 }
 
-function getRemovableRoleIds(member, botMember) {
+function getRemovableRoleIds(
+  member,
+  botMember,
+  excludedRoleIds = new Set(),
+) {
   const botHighestPosition = botMember.roles.highest.position;
 
   return member.roles.cache
@@ -1573,7 +1748,8 @@ function getRemovableRoleIds(member, botMember) {
       (role) =>
         role.id !== member.guild.id &&
         !role.managed &&
-        role.position < botHighestPosition,
+        role.position < botHighestPosition &&
+        !excludedRoleIds.has(role.id),
     )
     .map((role) => role.id);
 }
@@ -1614,6 +1790,7 @@ async function resolveWarningTarget(interaction) {
 
   return {
     member,
+    userId,
     display: userId ? `<@${userId}>` : typedName,
   };
 }
@@ -1670,6 +1847,8 @@ async function handleWarningCommand(interaction) {
     }
 
     let sanctionText;
+    let appliedSanctionRoleIds = [];
+    let appliedSanctionNames = [];
 
     if (type === "waarschuwing") {
       if (!target.member) {
@@ -1697,15 +1876,42 @@ async function handleWarningCommand(interaction) {
         `Waarschuwing door ${interaction.user.tag}: ${reason}`,
       );
       sanctionText = `<@&${sanctionRole.id}> — toegekend`;
+      appliedSanctionRoleIds = [sanctionRole.id];
+      appliedSanctionNames = [sanctionRole.name];
     } else {
       if (sanctionRole) {
         throw new Error(
-          "Kies bij ontslag geen sanctierol; alle rollen onder de bot worden verwijderd.",
+          "Kies bij ontslag geen sanctierol; de blacklistrollen worden automatisch toegekend.",
         );
       }
 
+      if (!target.userId) {
+        throw new Error(
+          "Kies bij ontslag een persoon of vul diens Discord-gebruikers-ID in, zodat de blacklist bewaard kan worden.",
+        );
+      }
+
+      const blacklistRoles = await getConfiguredBlacklistRoles(
+        interaction.guild,
+      );
+      const protectedRoleIds = new Set([
+        ...CONFIG.blacklistRoleIds,
+        ...CONFIG.terminationPreservedRoleIds,
+      ]);
+      appliedSanctionRoleIds = blacklistRoles.map((role) => role.id);
+      appliedSanctionNames = blacklistRoles.map((role) => role.name);
+
       if (target.member) {
-        const removableRoleIds = getRemovableRoleIds(target.member, botMember);
+        await target.member.roles.add(
+          blacklistRoles,
+          `Blacklist na ontslag door ${interaction.user.tag}: ${reason}`,
+        );
+
+        const removableRoleIds = getRemovableRoleIds(
+          target.member,
+          botMember,
+          protectedRoleIds,
+        );
 
         if (removableRoleIds.length > 0) {
           await target.member.roles.remove(
@@ -1714,10 +1920,12 @@ async function handleWarningCommand(interaction) {
           );
         }
 
-        sanctionText = `${removableRoleIds.length} verwijderbare ${removableRoleIds.length === 1 ? "rol" : "rollen"} verwijderd; rollen op of boven de bot zijn behouden`;
+        const preservedRoleMentions = CONFIG.terminationPreservedRoleIds
+          .filter((roleId) => target.member.roles.cache.has(roleId))
+          .map((roleId) => `<@&${roleId}>`);
+        sanctionText = `${blacklistRoles.map((role) => `<@&${role.id}>`).join(" en ")} toegekend; ${removableRoleIds.length} verwijderbare ${removableRoleIds.length === 1 ? "rol" : "rollen"} verwijderd${preservedRoleMentions.length > 0 ? `; ${preservedRoleMentions.join(", ")} behouden` : ""}`;
       } else {
-        sanctionText =
-          "Persoon was al uit de server — alleen de ontslagmelding is vastgelegd";
+        sanctionText = `${blacklistRoles.map((role) => `<@&${role.id}>`).join(" en ")} worden bij terugkomst automatisch toegekend`;
       }
     }
 
@@ -1734,13 +1942,20 @@ async function handleWarningCommand(interaction) {
           `> **Sanctie:** ${sanctionText}`,
         ].join("\n"),
       )
-      .setFooter({ text: `Uitgevoerd door ${interaction.user.tag}` })
+      .setFooter({
+        text:
+          type === "ontslagen"
+            ? `${CONFIG.blacklistMarker}:${target.userId} • Uitgevoerd door ${interaction.user.tag}`
+            : `Uitgevoerd door ${interaction.user.tag}`,
+      })
       .setTimestamp();
 
     await warningChannel.send({
       embeds: [warningEmbed],
       allowedMentions: { parse: [] },
     });
+
+    if (type === "ontslagen") blacklistUserIds.add(target.userId);
 
     queueSpreadsheetEvent(type === "waarschuwing" ? "warning" : "terminated", {
       discordId: target.member?.id || target.display.match(/\d{17,20}/)?.[0] || null,
@@ -1749,8 +1964,9 @@ async function handleWarningCommand(interaction) {
       currentRankName: currentRank.name,
       reason,
       source,
-      sanctionRoleId: sanctionRole?.id || null,
-      sanctionName: sanctionRole?.name || sanctionText,
+      sanctionRoleId: appliedSanctionRoleIds[0] || null,
+      sanctionRoleIds: appliedSanctionRoleIds,
+      sanctionName: appliedSanctionNames.join(", ") || sanctionText,
       actorId: interaction.user.id,
       actorName: interaction.member?.displayName || interaction.user.globalName || interaction.user.username,
       occurredAt: new Date().toISOString(),
@@ -2417,6 +2633,13 @@ client.on(Events.MessageDelete, (message) => {
 
 client.on(Events.GuildMemberAdd, (member) => {
   if (member.guild.id === dashboardGuildId) void refreshDashboard();
+
+  void restoreBlacklistRoles(member).catch((error) => {
+    console.error(
+      `Blacklistrollen konden na rejoin niet worden hersteld voor ${member.id}:`,
+      error,
+    );
+  });
 });
 
 client.on(Events.GuildMemberRemove, (member) => {
@@ -2523,6 +2746,16 @@ client.once(Events.ClientReady, async (readyClient) => {
   }
 
   try {
+    if (!dashboardGuild) {
+      throw new Error("De Discord-server kon niet worden gevonden.");
+    }
+
+    await restoreBlacklistRolesForGuild(dashboardGuild);
+  } catch (error) {
+    console.error("De blacklistrollen konden niet worden hersteld:", error);
+  }
+
+  try {
     const spreadsheet = await sendSpreadsheetEvent("ping", {
       actorId: readyClient.user.id,
       actorName: readyClient.user.username,
@@ -2556,6 +2789,7 @@ module.exports = {
   collectAttendance,
   collectAbsenceRecords,
   collectLatestActivity,
+  getBlacklistedUserId,
   getMissedDays,
   getMemberRankId,
   getMentionedUserIds,
