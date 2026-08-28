@@ -18,6 +18,7 @@ const CONFIG = Object.freeze({
   absenceChannelId: "1509628813628280842",
   attendanceArchiveChannelId: "1537265369352372346",
   warningChannelId: "1440369548388732949",
+  spreadsheetAutomationRoleId: "1543023051967430676",
   blacklistRoleIds: [
     "1542177617929703444",
     "1461807420740341835",
@@ -736,13 +737,18 @@ async function getRecentRoleChangeExecutor(guild, targetId) {
   }
 }
 
-function parseAcceptedMemberMessage(message) {
-  const text = getMessageText(message);
+function parseAcceptedMemberBlock_(text, messageId, recordIndex) {
   const discordId = getFormValue(text, "Discord ID").match(/\d{17,20}/)?.[0];
   const nameValue = getFormValue(text, "Naam");
   const mentionedNameId = nameValue.match(/<@!?(\d{17,20})>/)?.[1];
   const acceptedByValue = getFormValue(text, "Aangenomen door");
   const acceptedById = acceptedByValue.match(/<@!?(\d{17,20})>/)?.[1];
+  const changedByValue =
+    getFormValue(text, "Gewijzigd door") || getFormValue(text, "Tag");
+  const changedByRoleId = changedByValue.match(/<@&\s*(\d{17,20})>/)?.[1];
+  const changedById = changedByValue.match(/<@!?(\d{17,20})>/)?.[1];
+  const staffRankValue = getFormValue(text, "Staff Rang");
+  const staffRankId = staffRankValue.match(/<@&\s*(\d{17,20})>/)?.[1];
   const acceptedDate = getFormValue(text, "Datum aangenomen");
   const targetId = discordId || mentionedNameId;
 
@@ -754,8 +760,109 @@ function parseAcceptedMemberMessage(message) {
     acceptedDate,
     acceptedById: acceptedById || null,
     acceptedByName: acceptedByValue || null,
-    sourceMessageId: message.id,
+    changedById: changedById || null,
+    changedByName: changedByValue || null,
+    changedByRoleId: changedByRoleId || null,
+    staffRankId: staffRankId || null,
+    staffRankName: staffRankValue || null,
+    sourceMessageId: messageId,
+    sourceRecordIndex: recordIndex,
   };
+}
+
+function parseAcceptedMemberMessages(message) {
+  const text = getMessageText(message);
+  const starts = [];
+  const pattern = /(?:^|\n)\s*[>|]?\s*Naam:\s*/gim;
+  let match;
+
+  while ((match = pattern.exec(text))) {
+    starts.push(match.index + (match[0].startsWith("\n") ? 1 : 0));
+  }
+
+  if (starts.length === 0) return [];
+
+  return starts
+    .map((start, index) =>
+      parseAcceptedMemberBlock_(
+        text.slice(start, starts[index + 1] ?? text.length),
+        message.id,
+        index,
+      ),
+    )
+    .filter(Boolean);
+}
+
+function parseAcceptedMemberMessage(message) {
+  return parseAcceptedMemberMessages(message)[0] || null;
+}
+
+async function processAcceptedMessage(message) {
+  if (message.channelId !== CONFIG.acceptedChannelId) return false;
+
+  const fullMessage = message.partial
+    ? await message.fetch().catch(() => null)
+    : message;
+
+  if (!fullMessage) return false;
+
+  const acceptedMembers = parseAcceptedMemberMessages(fullMessage);
+  if (acceptedMembers.length === 0) return false;
+
+  const guild = fullMessage.guild;
+  if (!guild) return false;
+
+  await guild.roles.fetch().catch(() => undefined);
+
+  for (const acceptedMember of acceptedMembers) {
+    const member =
+      guild.members.cache.get(acceptedMember.discordId) ??
+      (await guild.members.fetch(acceptedMember.discordId).catch(() => null));
+    const snapshot = member ? getRoleSnapshot(member) : {};
+    const acceptedById = acceptedMember.acceptedById || fullMessage.author?.id;
+    const acceptedByMember = acceptedById
+      ? guild.members.cache.get(acceptedById) ??
+        (await guild.members.fetch(acceptedById).catch(() => null))
+      : null;
+    const changedByMember = acceptedMember.changedById
+      ? guild.members.cache.get(acceptedMember.changedById) ??
+        (await guild.members
+          .fetch(acceptedMember.changedById)
+          .catch(() => null))
+      : null;
+    const staffRank = acceptedMember.staffRankId
+      ? guild.roles.cache.get(acceptedMember.staffRankId)
+      : null;
+    const isAutomaticSystem =
+      acceptedMember.changedByRoleId === CONFIG.spreadsheetAutomationRoleId;
+
+    queueSpreadsheetEvent("accepted", {
+      ...acceptedMember,
+      name: member?.displayName || acceptedMember.name,
+      rankRoleId: snapshot.rankRoleId || null,
+      rankName: snapshot.rankName || null,
+      changedByRoleId:
+        acceptedMember.changedByRoleId || CONFIG.spreadsheetAutomationRoleId,
+      changedByName: isAutomaticSystem
+        ? "Automatisch Systeem"
+        : changedByMember?.displayName ||
+          acceptedMember.changedByName ||
+          "Automatisch Systeem",
+      acceptedById: acceptedById || null,
+      acceptedByName:
+        acceptedByMember?.displayName ||
+        acceptedMember.acceptedByName ||
+        fullMessage.author?.globalName ||
+        fullMessage.author?.username ||
+        null,
+      staffRankName: staffRank?.name || acceptedMember.staffRankName || null,
+      changedAt: new Date(
+        fullMessage.editedTimestamp || fullMessage.createdTimestamp,
+      ).toISOString(),
+    });
+  }
+
+  return true;
 }
 
 function getMarkedUserId(message, marker) {
@@ -2597,19 +2704,9 @@ client.on(Events.MessageCreate, (message) => {
   }
 
   if (message.channelId === CONFIG.acceptedChannelId) {
-    const acceptedMember = parseAcceptedMemberMessage(message);
-
-    if (acceptedMember) {
-      const member = message.guild?.members.cache.get(acceptedMember.discordId);
-      const snapshot = member ? getRoleSnapshot(member) : {};
-
-      queueSpreadsheetEvent("accepted", {
-        ...acceptedMember,
-        name: member?.displayName || acceptedMember.name,
-        rankRoleId: snapshot.rankRoleId || null,
-        rankName: snapshot.rankName || null,
-      });
-    }
+    void processAcceptedMessage(message).catch((error) => {
+      console.error("Aangenomen-bericht kon niet worden verwerkt:", error);
+    });
   }
 });
 
@@ -2619,6 +2716,12 @@ client.on(Events.MessageUpdate, (_oldMessage, newMessage) => {
     newMessage.channelId === CONFIG.absenceChannelId
   ) {
     void refreshDashboard();
+  }
+
+  if (newMessage.channelId === CONFIG.acceptedChannelId) {
+    void processAcceptedMessage(newMessage).catch((error) => {
+      console.error("Bewerkt aangenomen-bericht kon niet worden verwerkt:", error);
+    });
   }
 });
 
@@ -2766,7 +2869,7 @@ client.once(Events.ClientReady, async (readyClient) => {
 
     if (spreadsheet) {
       console.log(
-        `Spreadsheet verbonden: ${spreadsheet.spreadsheetId} / ${spreadsheet.sheetName}.`,
+        `Spreadsheet verbonden: ${spreadsheet.sheetName}.`,
       );
     }
   } catch (error) {
@@ -2805,5 +2908,6 @@ module.exports = {
   loadAllGuildMembers,
   parseAbsenceForm,
   parseAcceptedMemberMessage,
+  parseAcceptedMemberMessages,
   parseCommandDateTime,
 };
