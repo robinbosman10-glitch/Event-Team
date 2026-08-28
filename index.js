@@ -2869,7 +2869,7 @@ client.once(Events.ClientReady, async (readyClient) => {
 
     if (spreadsheet) {
       console.log(
-        `Spreadsheet verbonden: ${spreadsheet.spreadsheetId} / ${spreadsheet.sheetName}.`,
+        `Spreadsheet verbonden: ${spreadsheet.sheetName}.`,
       );
     }
   } catch (error) {
