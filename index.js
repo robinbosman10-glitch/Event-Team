@@ -5,6 +5,7 @@ const {
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  MessageFlags,
   Partials,
   PermissionFlagsBits,
   SlashCommandBuilder,
@@ -1872,7 +1873,7 @@ async function handleSheetTestCommand(interaction) {
     return;
   }
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   try {
     if (!interaction.inGuild()) {
@@ -1929,12 +1930,12 @@ async function handleAcceptedRefreshCommand(interaction) {
   ) {
     await interaction.reply({
       content: "❌ Alleen beheerders mogen deze command gebruiken.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   try {
     const channel = await client.channels.fetch(CONFIG.acceptedChannelId);
@@ -1944,13 +1945,17 @@ async function handleAcceptedRefreshCommand(interaction) {
     }
 
     const messages = await channel.messages.fetch({ limit: 50 });
-    const acceptedMessage = [...messages.values()].find(
-      (message) => parseAcceptedMemberMessages(message).length > 0,
+    const acceptedMessage = [...messages.values()].find((message) =>
+      parseAcceptedMemberMessages(message).some(
+        (record) =>
+          record.staffRankId ||
+          getCanonicalStaffRankName(record.staffRankName),
+      ),
     );
 
     if (!acceptedMessage) {
       throw new Error(
-        "Geen geldig aangenomen-bericht gevonden in de laatste 50 berichten.",
+        "Geen aangenomen-bericht met de volledige nieuwe template en Staff Rang gevonden in de laatste 50 berichten.",
       );
     }
 
@@ -2048,7 +2053,7 @@ async function handleWarningCommand(interaction) {
     return;
   }
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   try {
     if (!interaction.inGuild()) {
@@ -2233,7 +2238,7 @@ async function handleWarningRemoveCommand(interaction) {
     return;
   }
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   try {
     if (!interaction.inGuild()) {
@@ -2367,7 +2372,7 @@ async function handleBanCommand(interaction) {
   ) {
     await interaction.reply({
       content: `❌ <@${interaction.user.id}>, you can't use that.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
       allowedMentions: { users: [interaction.user.id] },
     });
     return;
@@ -2482,7 +2487,7 @@ async function handleUnbanCommand(interaction) {
   ) {
     await interaction.reply({
       content: `❌ <@${interaction.user.id}>, you can't use that.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
       allowedMentions: { users: [interaction.user.id] },
     });
     return;
@@ -2555,13 +2560,13 @@ async function handleDashboardRefreshCommand(interaction) {
   ) {
     await interaction.reply({
       content: `❌ <@${interaction.user.id}>, you can't use that.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
       allowedMentions: { users: [interaction.user.id] },
     });
     return;
   }
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   const isInactivity =
     interaction.commandName === refreshInactivityCommand.name;
@@ -2607,13 +2612,13 @@ async function handleDashboardResetCommand(interaction) {
   ) {
     await interaction.reply({
       content: `❌ <@${interaction.user.id}>, you can't use that.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
       allowedMentions: { users: [interaction.user.id] },
     });
     return;
   }
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   if (refreshInProgress) {
     await interaction.editReply(
@@ -2684,7 +2689,7 @@ async function handleAbsenceCommand(interaction) {
     return;
   }
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   try {
     if (!interaction.inGuild()) {
