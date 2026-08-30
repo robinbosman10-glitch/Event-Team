@@ -178,6 +178,12 @@ const sheetTestCommand = new SlashCommandBuilder()
   .setDefaultMemberPermissions(0)
   .setDMPermission(false);
 
+const refreshAcceptedSheetCommand = new SlashCommandBuilder()
+  .setName("werkaangenomen")
+  .setDescription("Verwerk het meest recente aangenomen-bericht opnieuw.")
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+  .setDMPermission(false);
+
 const warningRemoveCommand = new SlashCommandBuilder()
   .setName("warnweg")
   .setDescription("Trek een waarschuwing en de bijbehorende sanctierol in.")
@@ -832,21 +838,26 @@ function getCanonicalStaffRankName(value) {
 }
 
 async function processAcceptedMessage(message) {
-  if (message.channelId !== CONFIG.acceptedChannelId) return false;
+  if (message.channelId !== CONFIG.acceptedChannelId) {
+    return { recordCount: 0, spreadsheetResults: [] };
+  }
 
   const fullMessage = message.partial
     ? await message.fetch().catch(() => null)
     : message;
 
-  if (!fullMessage) return false;
+  if (!fullMessage) return { recordCount: 0, spreadsheetResults: [] };
 
   const acceptedMembers = parseAcceptedMemberMessages(fullMessage);
-  if (acceptedMembers.length === 0) return false;
+  if (acceptedMembers.length === 0) {
+    return { recordCount: 0, spreadsheetResults: [] };
+  }
 
   const guild = fullMessage.guild;
-  if (!guild) return false;
+  if (!guild) return { recordCount: 0, spreadsheetResults: [] };
 
   await guild.roles.fetch().catch(() => undefined);
+  const spreadsheetResults = [];
 
   for (const acceptedMember of acceptedMembers) {
     const member =
@@ -865,7 +876,11 @@ async function processAcceptedMessage(message) {
           .catch(() => null))
       : null;
     const staffRank = acceptedMember.staffRankId
-      ? guild.roles.cache.get(acceptedMember.staffRankId)
+      ? fullMessage.mentions.roles.get(acceptedMember.staffRankId) ??
+        guild.roles.cache.get(acceptedMember.staffRankId) ??
+        (await guild.roles
+          .fetch(acceptedMember.staffRankId)
+          .catch(() => null))
       : null;
     const staffRankName = getCanonicalStaffRankName(
       staffRank?.name || acceptedMember.staffRankName,
@@ -879,7 +894,7 @@ async function processAcceptedMessage(message) {
       );
     }
 
-    queueSpreadsheetEvent("accepted", {
+    const spreadsheetResult = await sendSpreadsheetEvent("accepted", {
       ...acceptedMember,
       name: member?.displayName || acceptedMember.name,
       rankRoleId: snapshot.rankRoleId || null,
@@ -904,9 +919,21 @@ async function processAcceptedMessage(message) {
         fullMessage.editedTimestamp || fullMessage.createdTimestamp,
       ).toISOString(),
     });
+
+    if (!spreadsheetResult) {
+      throw new Error(
+        "SHEET_WEBHOOK_URL of SHEET_WEBHOOK_SECRET ontbreekt bij de hosting.",
+      );
+    }
+
+    spreadsheetResults.push(spreadsheetResult);
   }
 
-  return true;
+  return {
+    recordCount: acceptedMembers.length,
+    sourceMessageId: fullMessage.id,
+    spreadsheetResults,
+  };
 }
 
 function getMarkedUserId(message, marker) {
@@ -1816,6 +1843,7 @@ async function registerCommands(guild) {
     resetInactivityCommand,
     resetActivityCommand,
     sheetTestCommand,
+    refreshAcceptedSheetCommand,
   ];
 
   for (const commandBuilder of commandBuilders) {
@@ -1832,7 +1860,7 @@ async function registerCommands(guild) {
   }
 
   console.log(
-    "Slash-commands /afwezig, /warn, /warnweg, /ban, /unban, /werkbijinactiviteit, /werkbijactiviteit, /resetinactiviteit, /resetactiviteit en /sheettest zijn geregistreerd.",
+    "Slash-commands /afwezig, /warn, /warnweg, /ban, /unban, /werkbijinactiviteit, /werkbijactiviteit, /resetinactiviteit, /resetactiviteit, /sheettest en /werkaangenomen zijn geregistreerd.",
   );
 }
 
@@ -1884,6 +1912,72 @@ async function handleSheetTestCommand(interaction) {
     );
   } catch (error) {
     await interaction.editReply(`❌ Spreadsheettest mislukt: ${error.message}`);
+  }
+}
+
+async function handleAcceptedRefreshCommand(interaction) {
+  if (
+    !interaction.isChatInputCommand() ||
+    interaction.commandName !== refreshAcceptedSheetCommand.name
+  ) {
+    return;
+  }
+
+  if (
+    !interaction.inGuild() ||
+    !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+  ) {
+    await interaction.reply({
+      content: "❌ Alleen beheerders mogen deze command gebruiken.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  try {
+    const channel = await client.channels.fetch(CONFIG.acceptedChannelId);
+
+    if (!channel?.isTextBased() || !channel.messages) {
+      throw new Error("Het aangenomen-kanaal is geen tekstkanaal.");
+    }
+
+    const messages = await channel.messages.fetch({ limit: 50 });
+    const acceptedMessage = [...messages.values()].find(
+      (message) => parseAcceptedMemberMessages(message).length > 0,
+    );
+
+    if (!acceptedMessage) {
+      throw new Error(
+        "Geen geldig aangenomen-bericht gevonden in de laatste 50 berichten.",
+      );
+    }
+
+    const result = await processAcceptedMessage(acceptedMessage);
+    const lastResult = result.spreadsheetResults.at(-1);
+
+    if (
+      !lastResult ||
+      typeof lastResult !== "object" ||
+      !("staffRank" in lastResult)
+    ) {
+      throw new Error(
+        "De actieve Apps Script-webapp draait nog een oude versie zonder H/I/K-controle.",
+      );
+    }
+
+    await interaction.editReply(
+      [
+        `✅ ${result.recordCount} aangenomen record(s) opnieuw verwerkt.`,
+        `**Rij:** ${lastResult.row}`,
+        `**H – Gewijzigd door:** ${lastResult.changedBy || "leeg"}`,
+        `**I – Aangenomen door:** ${lastResult.acceptedBy || "leeg"}`,
+        `**K – Staff Rang:** ${lastResult.staffRank || "leeg"}`,
+      ].join("\n"),
+    );
+  } catch (error) {
+    await interaction.editReply(`❌ Opnieuw verwerken mislukt: ${error.message}`);
   }
 }
 
@@ -2736,6 +2830,8 @@ client.on(Events.InteractionCreate, (interaction) => {
     void handleDashboardResetCommand(interaction);
   } else if (interaction.commandName === sheetTestCommand.name) {
     void handleSheetTestCommand(interaction);
+  } else if (interaction.commandName === refreshAcceptedSheetCommand.name) {
+    void handleAcceptedRefreshCommand(interaction);
   }
 });
 
