@@ -19,6 +19,19 @@ const CONFIG = Object.freeze({
   attendanceArchiveChannelId: "1537265369352372346",
   warningChannelId: "1440369548388732949",
   spreadsheetAutomationRoleId: "1543023051967430676",
+  spreadsheetStaffRankNames: [
+    "Hoge Raad",
+    "Hoofd Management",
+    "Management",
+    "Junior Management",
+    "Senior Admin",
+    "Admin",
+    "Junior Admin",
+    "Senior Moderator",
+    "Moderator",
+    "Junior Moderator",
+    "N.V.T.",
+  ],
   blacklistRoleIds: [
     "1542177617929703444",
     "1461807420740341835",
@@ -797,6 +810,25 @@ function parseAcceptedMemberMessage(message) {
   return parseAcceptedMemberMessages(message)[0] || null;
 }
 
+function getCanonicalStaffRankName(value) {
+  const normalizedValue = String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+
+  return (
+    CONFIG.spreadsheetStaffRankNames.find(
+      (rankName) =>
+        rankName
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .toLowerCase()
+          .replace(/[^a-z0-9]/g, "") === normalizedValue,
+    ) || null
+  );
+}
+
 async function processAcceptedMessage(message) {
   if (message.channelId !== CONFIG.acceptedChannelId) return false;
 
@@ -833,8 +865,17 @@ async function processAcceptedMessage(message) {
     const staffRank = acceptedMember.staffRankId
       ? guild.roles.cache.get(acceptedMember.staffRankId)
       : null;
+    const staffRankName = getCanonicalStaffRankName(
+      staffRank?.name || acceptedMember.staffRankName,
+    );
     const isAutomaticSystem =
       acceptedMember.changedByRoleId === CONFIG.spreadsheetAutomationRoleId;
+
+    if (!staffRankName) {
+      console.warn(
+        `Onbekende Staff Rang in aangenomen-bericht ${fullMessage.id}: ${acceptedMember.staffRankName || "ontbreekt"}.`,
+      );
+    }
 
     queueSpreadsheetEvent("accepted", {
       ...acceptedMember,
@@ -855,7 +896,8 @@ async function processAcceptedMessage(message) {
         fullMessage.author?.globalName ||
         fullMessage.author?.username ||
         null,
-      staffRankName: staffRank?.name || acceptedMember.staffRankName || null,
+      staffRankName:
+        staffRankName || staffRank?.name || acceptedMember.staffRankName || null,
       changedAt: new Date(
         fullMessage.editedTimestamp || fullMessage.createdTimestamp,
       ).toISOString(),
@@ -2902,6 +2944,7 @@ module.exports = {
   getMonthStart,
   getMostRecentCompletedWeek,
   getRemovableRoleIds,
+  getCanonicalStaffRankName,
   getVisibleAbsenceRecords,
   getWeekPeriod,
   isWeeklyArchiveTime,
