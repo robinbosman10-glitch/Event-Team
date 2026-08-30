@@ -582,7 +582,19 @@ function applyAccepted_(context, data) {
     true,
     true,
   );
-  return `Aangenomen persoon bijgewerkt op rij ${row}.`;
+  return {
+    message: `Aangenomen persoon bijgewerkt op rij ${row}.`,
+    row,
+    changedBy: context.sheet
+      .getRange(row, AFR_ACCEPTED_COLUMNS.changedBy)
+      .getDisplayValue(),
+    acceptedBy: context.sheet
+      .getRange(row, AFR_ACCEPTED_COLUMNS.acceptedBy)
+      .getDisplayValue(),
+    staffRank: context.sheet
+      .getRange(row, AFR_ACCEPTED_COLUMNS.staffRank)
+      .getDisplayValue(),
+  };
 }
 
 function applyRankChange_(context, data) {
