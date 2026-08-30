@@ -15,6 +15,13 @@ const AFR_SHEET_GID = 0;
 const AFR_SPREADSHEET_ID_PROPERTY = "AFR_SPREADSHEET_ID";
 const AFR_SECRET_PROPERTY = "AFR_SHEET_WEBHOOK_SECRET";
 const AFR_HEADER_SEARCH_ROWS = 20;
+const AFR_ACCEPTED_COLUMNS = Object.freeze({
+  acceptedDate: 5,
+  lastChanged: 6,
+  changedBy: 7,
+  acceptedBy: 8,
+  staffRank: 10,
+});
 const AFR_STAFF_RANKS = Object.freeze([
   "Hoge Raad",
   "Hoofd Management",
@@ -325,30 +332,16 @@ function setColumnValue_(context, row, headerName, value, validated) {
   const column = context.headers[normalizeHeader_(headerName)];
   if (!column) return false;
 
+  return setColumnNumberValue_(context, row, column, value, validated);
+}
+
+function setColumnNumberValue_(context, row, column, value, validated) {
   const cell = context.sheet.getRange(row, column);
   if (cell.getFormula()) return false;
 
   if (validated) selectAllowedValue_(cell, value, false);
   else cell.setValue(value);
   return true;
-}
-
-function setFirstAvailableColumnValue_(
-  context,
-  row,
-  headerNames,
-  value,
-  validated,
-) {
-  for (let index = 0; index < headerNames.length; index += 1) {
-    if (
-      setColumnValue_(context, row, headerNames[index], value, validated)
-    ) {
-      return true;
-    }
-  }
-
-  return false;
 }
 
 function parseDutchDate_(value) {
@@ -459,32 +452,38 @@ function applyAccepted_(context, data) {
   setColumnValue_(context, row, "Status", ["Actief", "Active"], true);
   const acceptedAt = parseDutchDate_(data.acceptedDate);
 
-  setFirstAvailableColumnValue_(
+  setColumnNumberValue_(
     context,
     row,
-    ["Datum Aangenomen", "Aangenomen op"],
+    AFR_ACCEPTED_COLUMNS.acceptedDate,
     acceptedAt,
     false,
   );
-  setColumnValue_(context, row, "Laatste Wijziging", acceptedAt, false);
-  setColumnValue_(
+  setColumnNumberValue_(
     context,
     row,
-    "Gewijzigd door",
-    ["Automatisch Systeem", data.changedByName],
+    AFR_ACCEPTED_COLUMNS.lastChanged,
+    acceptedAt,
+    false,
+  );
+  setColumnNumberValue_(
+    context,
+    row,
+    AFR_ACCEPTED_COLUMNS.changedBy,
+    ["Automatisch Systeem", "Automatische Systeem"],
     true,
   );
-  setColumnValue_(
+  setColumnNumberValue_(
     context,
     row,
-    "Aangenomen Door",
+    AFR_ACCEPTED_COLUMNS.acceptedBy,
     [data.acceptedByName, data.acceptedById],
     true,
   );
-  setColumnValue_(
+  setColumnNumberValue_(
     context,
     row,
-    "Staff Rang",
+    AFR_ACCEPTED_COLUMNS.staffRank,
     getStaffRankCandidates_(data),
     true,
   );
