@@ -16,11 +16,14 @@ const AFR_SPREADSHEET_ID_PROPERTY = "AFR_SPREADSHEET_ID";
 const AFR_SECRET_PROPERTY = "AFR_SHEET_WEBHOOK_SECRET";
 const AFR_HEADER_SEARCH_ROWS = 20;
 const AFR_ACCEPTED_COLUMNS = Object.freeze({
-  acceptedDate: 5,
-  lastChanged: 6,
-  changedBy: 7,
-  acceptedBy: 8,
-  staffRank: 10,
+  name: 3,
+  discordId: 4,
+  status: 5,
+  acceptedDate: 6,
+  lastChanged: 7,
+  changedBy: 8,
+  acceptedBy: 9,
+  staffRank: 11,
 });
 const AFR_STAFF_RANKS = Object.freeze([
   "Hoge Raad",
@@ -447,9 +450,27 @@ function applyAccepted_(context, data) {
     row = ensureMemberAtRank_(context, data);
   }
 
-  setColumnValue_(context, row, "Naam", data.name || "Onbekend", false);
-  setColumnValue_(context, row, "Discord ID", `<@${data.discordId}>`, false);
-  setColumnValue_(context, row, "Status", ["Actief", "Active"], true);
+  setColumnNumberValue_(
+    context,
+    row,
+    AFR_ACCEPTED_COLUMNS.name,
+    data.name || "Onbekend",
+    false,
+  );
+  setColumnNumberValue_(
+    context,
+    row,
+    AFR_ACCEPTED_COLUMNS.discordId,
+    `<@${data.discordId}>`,
+    false,
+  );
+  setColumnNumberValue_(
+    context,
+    row,
+    AFR_ACCEPTED_COLUMNS.status,
+    ["Actief", "Active"],
+    true,
+  );
   const acceptedAt = parseDutchDate_(data.acceptedDate);
 
   setColumnNumberValue_(
