@@ -5,6 +5,7 @@ const {
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  Partials,
   PermissionFlagsBits,
   SlashCommandBuilder,
 } = require("discord.js");
@@ -268,6 +269,7 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
   ],
+  partials: [Partials.Channel, Partials.Message],
 });
 
 const dashboardMessagesByMarker = new Map();
