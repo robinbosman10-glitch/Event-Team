@@ -347,6 +347,14 @@ function setColumnNumberValue_(context, row, column, value, validated) {
   return true;
 }
 
+function clearColumnNumberValue_(context, row, column) {
+  const cell = context.sheet.getRange(row, column);
+  if (cell.getFormula()) return false;
+
+  cell.clearContent();
+  return true;
+}
+
 function parseDutchDate_(value) {
   const match = String(value || "").match(/(\d{1,2})[-/](\d{1,2})[-/](\d{4})/);
   if (!match) return new Date();
@@ -407,8 +415,58 @@ function clearMemberRow_(context, row) {
 
 function resetVacantMemberRow_(context, row) {
   clearMemberRow_(context, row);
-  setColumnValue_(context, row, "Naam", "[AFR]", false);
-  setColumnValue_(context, row, "Discord ID", "<@>", false);
+  setColumnNumberValue_(
+    context,
+    row,
+    AFR_ACCEPTED_COLUMNS.name,
+    "[AFR]",
+    false,
+  );
+  setColumnNumberValue_(
+    context,
+    row,
+    AFR_ACCEPTED_COLUMNS.discordId,
+    "<@>",
+    false,
+  );
+  setColumnNumberValue_(
+    context,
+    row,
+    AFR_ACCEPTED_COLUMNS.status,
+    ["N.V.T.", "N.V.T", "NVT"],
+    true,
+  );
+  clearColumnNumberValue_(
+    context,
+    row,
+    AFR_ACCEPTED_COLUMNS.acceptedDate,
+  );
+  clearColumnNumberValue_(
+    context,
+    row,
+    AFR_ACCEPTED_COLUMNS.lastChanged,
+  );
+  setColumnNumberValue_(
+    context,
+    row,
+    AFR_ACCEPTED_COLUMNS.changedBy,
+    ["N.V.T.", "N.V.T", "NVT"],
+    true,
+  );
+  setColumnNumberValue_(
+    context,
+    row,
+    AFR_ACCEPTED_COLUMNS.acceptedBy,
+    ["N.V.T.", "N.V.T", "NVT"],
+    true,
+  );
+  setColumnNumberValue_(
+    context,
+    row,
+    AFR_ACCEPTED_COLUMNS.staffRank,
+    ["N.V.T.", "N.V.T", "NVT"],
+    true,
+  );
 }
 
 function getRankBlockEnd_(context, row) {
