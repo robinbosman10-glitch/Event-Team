@@ -15,6 +15,19 @@ const AFR_SHEET_GID = 0;
 const AFR_SPREADSHEET_ID_PROPERTY = "AFR_SPREADSHEET_ID";
 const AFR_SECRET_PROPERTY = "AFR_SHEET_WEBHOOK_SECRET";
 const AFR_HEADER_SEARCH_ROWS = 20;
+const AFR_STAFF_RANKS = Object.freeze([
+  "Hoge Raad",
+  "Hoofd Management",
+  "Management",
+  "Junior Management",
+  "Senior Admin",
+  "Admin",
+  "Junior Admin",
+  "Senior Moderator",
+  "Moderator",
+  "Junior Moderator",
+  "N.V.T.",
+]);
 
 function setupSpreadsheetWebhook() {
   const secret = `${Utilities.getUuid()}${Utilities.getUuid()}`.replace(/-/g, "");
@@ -87,7 +100,7 @@ function processDiscordEvent_(type, data) {
     case "warning_removed":
       return applyWarningRemoval_(context, data);
     case "terminated":
-      return applyDeparture_(context, data, "Ontslagen");
+      return applyTermination_(context, data);
     case "departed":
       return applyDeparture_(context, data, "Uit dienst");
     default:
@@ -344,6 +357,15 @@ function parseDutchDate_(value) {
   return new Date(Number(match[3]), Number(match[2]) - 1, Number(match[1]));
 }
 
+function getStaffRankCandidates_(data) {
+  const requestedRank = normalizeText_(data.staffRankName);
+  const canonicalRank = AFR_STAFF_RANKS.find(
+    (rankName) => normalizeText_(rankName) === requestedRank,
+  );
+
+  return [canonicalRank, data.staffRankName, data.staffRankId];
+}
+
 function moveMemberRow_(context, sourceRow, destinationRow) {
   if (!sourceRow || sourceRow === destinationRow) return;
 
@@ -385,6 +407,34 @@ function clearMemberRow_(context, row) {
       cell.clearContent();
     }
   });
+}
+
+function resetVacantMemberRow_(context, row) {
+  clearMemberRow_(context, row);
+  setColumnValue_(context, row, "Naam", "[AFR]", false);
+  setColumnValue_(context, row, "Discord ID", "<@>", false);
+}
+
+function getRankBlockEnd_(context, row) {
+  const rankColumn = context.headers.rang;
+  const rankName = context.sheet.getRange(row, rankColumn).getDisplayValue();
+  const normalizedRank = normalizeText_(rankName);
+  let endRow = row;
+
+  for (
+    let candidateRow = row + 1;
+    candidateRow <= context.lastDataRow;
+    candidateRow += 1
+  ) {
+    const candidateRank = context.sheet
+      .getRange(candidateRow, rankColumn)
+      .getDisplayValue();
+
+    if (normalizeText_(candidateRank) !== normalizedRank) break;
+    endRow = candidateRow;
+  }
+
+  return endRow;
 }
 
 function ensureMemberAtRank_(context, data) {
@@ -435,7 +485,7 @@ function applyAccepted_(context, data) {
     context,
     row,
     "Staff Rang",
-    [data.staffRankName, data.staffRankId],
+    getStaffRankCandidates_(data),
     true,
   );
   return `Aangenomen persoon bijgewerkt op rij ${row}.`;
@@ -520,6 +570,38 @@ function applyWarningRemoval_(context, data) {
   return nextNumber > 0
     ? `Waarschuwing verlaagd naar ${nextNumber} op rij ${row}.`
     : `Laatste waarschuwing verwijderd op rij ${row}; waarde teruggezet naar N.V.T.`;
+}
+
+function applyTermination_(context, data) {
+  if (!data.discordId) {
+    return "Geen Discord-ID; er is geen bestaande rij leeggemaakt.";
+  }
+
+  const row = findMemberRow_(context, data.discordId);
+  if (!row) return `Discord-ID ${data.discordId} stond niet in het tabblad.`;
+
+  const rankBlockEnd = getRankBlockEnd_(context, row);
+  let destinationRow = row;
+
+  for (
+    let sourceRow = row + 1;
+    sourceRow <= rankBlockEnd;
+    sourceRow += 1
+  ) {
+    const sourceDiscordId = normalizeDiscordId_(
+      context.sheet
+        .getRange(sourceRow, context.headers.discordid)
+        .getDisplayValue(),
+    );
+
+    if (!sourceDiscordId) continue;
+
+    moveMemberRow_(context, sourceRow, destinationRow);
+    destinationRow += 1;
+  }
+
+  resetVacantMemberRow_(context, destinationRow);
+  return `Ontslagen persoon verwijderd; lege regel staat onderaan het rangblok op rij ${destinationRow}.`;
 }
 
 function applyDeparture_(context, data, preferredStatus) {
