@@ -338,9 +338,19 @@ function setColumnValue_(context, row, headerName, value, validated) {
   return setColumnNumberValue_(context, row, column, value, validated);
 }
 
-function setColumnNumberValue_(context, row, column, value, validated) {
+function setColumnNumberValue_(
+  context,
+  row,
+  column,
+  value,
+  validated,
+  overwriteFormula,
+) {
   const cell = context.sheet.getRange(row, column);
-  if (cell.getFormula()) return false;
+  if (cell.getFormula()) {
+    if (!overwriteFormula) return false;
+    cell.clearContent();
+  }
 
   if (validated) selectAllowedValue_(cell, value, false);
   else cell.setValue(value);
@@ -452,6 +462,7 @@ function resetVacantMemberRow_(context, row) {
     AFR_ACCEPTED_COLUMNS.changedBy,
     ["N.V.T.", "N.V.T", "NVT"],
     true,
+    true,
   );
   setColumnNumberValue_(
     context,
@@ -459,12 +470,14 @@ function resetVacantMemberRow_(context, row) {
     AFR_ACCEPTED_COLUMNS.acceptedBy,
     ["N.V.T.", "N.V.T", "NVT"],
     true,
+    true,
   );
   setColumnNumberValue_(
     context,
     row,
     AFR_ACCEPTED_COLUMNS.staffRank,
     ["N.V.T.", "N.V.T", "NVT"],
+    true,
     true,
   );
 }
@@ -551,6 +564,7 @@ function applyAccepted_(context, data) {
     AFR_ACCEPTED_COLUMNS.changedBy,
     ["Automatisch Systeem", "Automatische Systeem"],
     true,
+    true,
   );
   setColumnNumberValue_(
     context,
@@ -558,12 +572,14 @@ function applyAccepted_(context, data) {
     AFR_ACCEPTED_COLUMNS.acceptedBy,
     [data.acceptedByName, data.acceptedById],
     true,
+    true,
   );
   setColumnNumberValue_(
     context,
     row,
     AFR_ACCEPTED_COLUMNS.staffRank,
     getStaffRankCandidates_(data),
+    true,
     true,
   );
   return `Aangenomen persoon bijgewerkt op rij ${row}.`;
