@@ -1,6 +1,10 @@
 const path = require("node:path");
+const { randomUUID } = require("node:crypto");
 const {
+  ActionRowBuilder,
   AuditLogEvent,
+  ButtonBuilder,
+  ButtonStyle,
   Client,
   EmbedBuilder,
   Events,
@@ -9,6 +13,8 @@ const {
   Partials,
   PermissionFlagsBits,
   SlashCommandBuilder,
+  StringSelectMenuBuilder,
+  UserSelectMenuBuilder,
 } = require("discord.js");
 
 process.env.TZ = "Europe/Amsterdam";
@@ -185,6 +191,18 @@ const refreshAcceptedSheetCommand = new SlashCommandBuilder()
   .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
   .setDMPermission(false);
 
+const promotionCommand = new SlashCommandBuilder()
+  .setName("promotie")
+  .setDescription("Promoveer één of meerdere leden naar een hogere rang.")
+  .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+  .setDMPermission(false)
+  .addRoleOption((option) =>
+    option
+      .setName("tagrol")
+      .setDescription("De rol die in de promotieaankondiging wordt getagd.")
+      .setRequired(true),
+  );
+
 const warningRemoveCommand = new SlashCommandBuilder()
   .setName("warnweg")
   .setDescription("Trek een waarschuwing en de bijbehorende sanctierol in.")
@@ -282,6 +300,7 @@ const client = new Client({
 const dashboardMessagesByMarker = new Map();
 const dashboardResetTimestamps = new Map();
 const blacklistUserIds = new Set();
+const promotionSessions = new Map();
 let refreshInProgress = false;
 let dashboardGuildId = null;
 let archiveTestSentThisSession = false;
@@ -1845,6 +1864,7 @@ async function registerCommands(guild) {
     resetActivityCommand,
     sheetTestCommand,
     refreshAcceptedSheetCommand,
+    promotionCommand,
   ];
 
   for (const commandBuilder of commandBuilders) {
@@ -1861,8 +1881,639 @@ async function registerCommands(guild) {
   }
 
   console.log(
-    "Slash-commands /afwezig, /warn, /warnweg, /ban, /unban, /werkbijinactiviteit, /werkbijactiviteit, /resetinactiviteit, /resetactiviteit, /sheettest en /werkaangenomen zijn geregistreerd.",
+    "Slash-commands /afwezig, /warn, /warnweg, /ban, /unban, /werkbijinactiviteit, /werkbijactiviteit, /resetinactiviteit, /resetactiviteit, /sheettest, /werkaangenomen en /promotie zijn geregistreerd.",
   );
+}
+
+function getPromotionTargetIndex(currentIndex, promotionCount) {
+  if (
+    !Number.isInteger(currentIndex) ||
+    !Number.isInteger(promotionCount) ||
+    currentIndex <= 0 ||
+    promotionCount < 1 ||
+    promotionCount > currentIndex
+  ) {
+    return null;
+  }
+
+  return currentIndex - promotionCount;
+}
+
+function getLimitedPromotionLines(lines, maximumItems = 15) {
+  const visibleLines = lines
+    .slice(0, maximumItems)
+    .map((line) => cleanEmbedValue(line, 110));
+  const hiddenCount = lines.length - visibleLines.length;
+
+  if (hiddenCount > 0) {
+    visibleLines.push(`• … en nog ${hiddenCount} andere.`);
+  }
+
+  return visibleLines;
+}
+
+function getPromotionUserSelectView(session, errorLines = []) {
+  const userSelect = new UserSelectMenuBuilder()
+    .setCustomId(`promo:users:${session.id}`)
+    .setPlaceholder("Kies 1 tot en met 25 personen")
+    .setMinValues(1)
+    .setMaxValues(25);
+  const content = [
+    "## 🎖️ Promotieformulier",
+    `**Aankondiging tagt:** <@&${session.tagRoleId}>`,
+    "Kies hieronder alle personen die je wilt promoveren.",
+  ];
+
+  if (errorLines.length > 0) {
+    content.push(
+      "",
+      "**Niet geselecteerd:**",
+      ...getLimitedPromotionLines(errorLines),
+    );
+  }
+
+  return {
+    content: content.join("\n"),
+    embeds: [],
+    components: [new ActionRowBuilder().addComponents(userSelect)],
+    allowedMentions: { parse: [] },
+  };
+}
+
+function getPromotionCountView(session, guild) {
+  const record = session.members[session.currentMemberIndex];
+  const options = [];
+
+  for (let count = 1; count <= record.currentRankIndex; count += 1) {
+    const targetIndex = getPromotionTargetIndex(
+      record.currentRankIndex,
+      count,
+    );
+    const targetRole = guild.roles.cache.get(
+      CONFIG.rankRoleIds[targetIndex],
+    );
+
+    options.push({
+      label: `${count} promotie${count === 1 ? "" : "s"}`,
+      description: `Naar ${targetRole?.name || `rang ${targetIndex + 1}`}`.slice(
+        0,
+        100,
+      ),
+      value: String(count),
+    });
+  }
+
+  const countSelect = new StringSelectMenuBuilder()
+    .setCustomId(`promo:count:${session.id}:${record.id}`)
+    .setPlaceholder("Kies het aantal promoties")
+    .addOptions(options);
+
+  const content = [
+    "## 🎖️ Promotieformulier",
+    `**Persoon ${session.currentMemberIndex + 1} van ${session.members.length}:** <@${record.id}>`,
+    `**Huidige rang:** <@&${record.currentRankId}>`,
+    "Kies hoeveel rangen deze persoon omhooggaat.",
+  ];
+
+  if (
+    session.currentMemberIndex === 0 &&
+    session.selectionWarnings?.length > 0
+  ) {
+    content.push(
+      "",
+      "**Deze selecties zijn overgeslagen:**",
+      ...getLimitedPromotionLines(session.selectionWarnings),
+    );
+  }
+
+  return {
+    content: content.join("\n"),
+    embeds: [],
+    components: [new ActionRowBuilder().addComponents(countSelect)],
+    allowedMentions: { parse: [] },
+  };
+}
+
+function buildPromotionReviewEmbed(session, guild) {
+  const fields = session.members.map((record) => {
+    const targetIndex = getPromotionTargetIndex(
+      record.currentRankIndex,
+      record.promotionCount,
+    );
+    const targetRoleId = CONFIG.rankRoleIds[targetIndex];
+
+    return {
+      name: cleanEmbedValue(record.displayName, 256) || record.id,
+      value: [
+        `**Persoon:** <@${record.id}>`,
+        `**Van:** <@&${record.currentRankId}>`,
+        `**Naar:** <@&${targetRoleId}>`,
+        `**Aantal promoties:** ${record.promotionCount}`,
+      ].join("\n"),
+      inline: false,
+    };
+  });
+
+  return new EmbedBuilder()
+    .setColor(0xfee75c)
+    .setTitle("🎖️ Promoties controleren")
+    .setDescription(
+      `Controleer alles goed. Na bevestigen worden de rollen direct aangepast en wordt <@&${session.tagRoleId}> getagd.`,
+    )
+    .addFields(fields)
+    .setFooter({ text: guild.name })
+    .setTimestamp();
+}
+
+function getPromotionReviewView(session, guild) {
+  const confirmButton = new ButtonBuilder()
+    .setCustomId(`promo:confirm:${session.id}`)
+    .setLabel("Promoties uitvoeren")
+    .setEmoji("✅")
+    .setStyle(ButtonStyle.Success);
+  const cancelButton = new ButtonBuilder()
+    .setCustomId(`promo:cancel:${session.id}`)
+    .setLabel("Annuleren")
+    .setEmoji("✖️")
+    .setStyle(ButtonStyle.Danger);
+
+  return {
+    content: "",
+    embeds: [buildPromotionReviewEmbed(session, guild)],
+    components: [
+      new ActionRowBuilder().addComponents(confirmButton, cancelButton),
+    ],
+    allowedMentions: { parse: [] },
+  };
+}
+
+function getPromotionSession(interaction) {
+  const [, action, sessionId] = interaction.customId.split(":");
+  const session = promotionSessions.get(sessionId);
+
+  if (!session || session.expiresAt <= Date.now()) {
+    if (session) promotionSessions.delete(sessionId);
+    throw new Error(
+      "Dit promotieformulier is verlopen. Gebruik `/promotie` opnieuw.",
+    );
+  }
+
+  if (
+    interaction.user.id !== session.ownerId ||
+    interaction.guildId !== session.guildId ||
+    interaction.channelId !== session.channelId
+  ) {
+    throw new Error("Alleen de beheerder die dit formulier startte kan dit gebruiken.");
+  }
+
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+    throw new Error("Je hebt geen beheerdersrechten meer.");
+  }
+
+  return { action, session };
+}
+
+async function replyPromotionComponentError(interaction, error) {
+  const content = `❌ ${error.message || error}`;
+
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply({ content, embeds: [], components: [] });
+  } else {
+    await interaction.reply({
+      content,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+}
+
+async function handlePromotionCommand(interaction) {
+  if (
+    !interaction.isChatInputCommand() ||
+    interaction.commandName !== promotionCommand.name
+  ) {
+    return;
+  }
+
+  try {
+    if (
+      !interaction.inGuild() ||
+      !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+    ) {
+      throw new Error("Alleen beheerders mogen deze command gebruiken.");
+    }
+
+    const tagRole = interaction.options.getRole("tagrol", true);
+    const botMember =
+      interaction.guild.members.me ??
+      (await interaction.guild.members.fetchMe());
+    const channelPermissions = interaction.channel?.permissionsFor(botMember);
+
+    if (tagRole.id === interaction.guildId) {
+      throw new Error("Kies een normale rol in plaats van `@everyone`.");
+    }
+
+    if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) {
+      throw new Error("De bot mist de machtiging `Rollen beheren`.");
+    }
+
+    if (
+      !interaction.channel?.isTextBased() ||
+      !channelPermissions?.has([
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.EmbedLinks,
+      ])
+    ) {
+      throw new Error(
+        "De bot kan in dit kanaal geen berichten en embeds plaatsen.",
+      );
+    }
+
+    if (
+      !tagRole.mentionable &&
+      !channelPermissions.has(PermissionFlagsBits.MentionEveryone)
+    ) {
+      throw new Error(
+        "Deze tagrol is niet vermeldbaar en de bot mist `@everyone, @here en alle rollen vermelden`.",
+      );
+    }
+
+    const sessionId = randomUUID().replaceAll("-", "").slice(0, 16);
+    const session = {
+      id: sessionId,
+      ownerId: interaction.user.id,
+      guildId: interaction.guildId,
+      channelId: interaction.channelId,
+      tagRoleId: tagRole.id,
+      members: [],
+      selectionWarnings: [],
+      currentMemberIndex: 0,
+      processing: false,
+      expiresAt: Date.now() + 15 * 60 * 1000,
+    };
+
+    promotionSessions.set(sessionId, session);
+    const expirationTimer = setTimeout(
+      () => promotionSessions.delete(sessionId),
+      15 * 60 * 1000,
+    );
+    expirationTimer.unref?.();
+
+    await interaction.reply({
+      ...getPromotionUserSelectView(session),
+      flags: MessageFlags.Ephemeral,
+    });
+  } catch (error) {
+    await replyPromotionComponentError(interaction, error);
+  }
+}
+
+async function handlePromotionUserSelection(interaction, session) {
+  await interaction.deferUpdate();
+  await interaction.guild.roles.fetch();
+
+  const selectedMembers = [];
+  const errorLines = [];
+
+  for (const memberId of interaction.values) {
+    const member = await interaction.guild.members
+      .fetch(memberId)
+      .catch(() => null);
+
+    if (!member) {
+      errorLines.push(`• <@${memberId}> zit niet meer in de server.`);
+      continue;
+    }
+
+    if (member.user.bot) {
+      errorLines.push(`• <@${memberId}> is een bot.`);
+      continue;
+    }
+
+    const currentRankId = getMemberRankId(member);
+    const currentRankIndex = CONFIG.rankRoleIds.indexOf(currentRankId);
+
+    if (currentRankIndex < 0) {
+      errorLines.push(`• <@${memberId}> heeft geen gekoppelde rang.`);
+      continue;
+    }
+
+    if (currentRankIndex === 0) {
+      errorLines.push(`• <@${memberId}> heeft de hoogste rang al.`);
+      continue;
+    }
+
+    if (!member.manageable) {
+      errorLines.push(
+        `• De hoogste botrol staat niet boven de rang van <@${memberId}>.`,
+      );
+      continue;
+    }
+
+    selectedMembers.push({
+      id: member.id,
+      displayName: member.displayName,
+      currentRankId,
+      currentRankIndex,
+      promotionCount: null,
+    });
+  }
+
+  if (selectedMembers.length === 0) {
+    await interaction.editReply(
+      getPromotionUserSelectView(session, errorLines),
+    );
+    return;
+  }
+
+  session.members = selectedMembers;
+  session.selectionWarnings = errorLines;
+  session.currentMemberIndex = 0;
+  await interaction.editReply(getPromotionCountView(session, interaction.guild));
+}
+
+async function handlePromotionCountSelection(interaction, session) {
+  const record = session.members[session.currentMemberIndex];
+  const memberId = interaction.customId.split(":")[3];
+  const promotionCount = Number(interaction.values[0]);
+
+  if (!record || record.id !== memberId) {
+    throw new Error("Deze stap van het formulier is niet meer actueel.");
+  }
+
+  if (
+    getPromotionTargetIndex(record.currentRankIndex, promotionCount) === null
+  ) {
+    throw new Error("Dit aantal promoties is niet geldig voor deze persoon.");
+  }
+
+  record.promotionCount = promotionCount;
+  session.currentMemberIndex += 1;
+
+  if (session.currentMemberIndex < session.members.length) {
+    await interaction.update(
+      getPromotionCountView(session, interaction.guild),
+    );
+    return;
+  }
+
+  await interaction.update(getPromotionReviewView(session, interaction.guild));
+}
+
+function buildPromotionAnnouncementEmbed(successes, interaction) {
+  const fields = successes.map((result) => ({
+    name: `🎉 ${cleanEmbedValue(result.displayName, 250) || result.memberId}`,
+    value: [
+      `**Persoon:** <@${result.memberId}>`,
+      `**Oude rang:** <@&${result.oldRankId}>`,
+      `**Nieuwe rang:** <@&${result.newRankId}>`,
+      `**Aantal promoties:** ${result.promotionCount}`,
+    ].join("\n"),
+    inline: false,
+  }));
+
+  const executorName =
+    interaction.guild.members.cache.get(interaction.user.id)?.displayName ||
+    interaction.user.globalName ||
+    interaction.user.username;
+  const embed = new EmbedBuilder()
+    .setColor(0xfee75c)
+    .setTitle("🎉 Promoties")
+    .setDescription(
+      successes.length === 1
+        ? "Van harte gefeliciteerd met je promotie!"
+        : "Van harte gefeliciteerd met jullie promoties!",
+    )
+    .addFields(fields)
+    .setFooter({
+      text: `Uitgevoerd door ${executorName}`,
+      iconURL: interaction.user.displayAvatarURL(),
+    })
+    .setTimestamp();
+
+  const guildIconUrl = interaction.guild.iconURL();
+  if (guildIconUrl) embed.setThumbnail(guildIconUrl);
+  return embed;
+}
+
+async function applyPromotion(record, interaction, botMember) {
+  const member = await interaction.guild.members.fetch(record.id);
+  const currentRankId = getMemberRankId(member);
+  const currentRankIndex = CONFIG.rankRoleIds.indexOf(currentRankId);
+
+  if (currentRankId !== record.currentRankId) {
+    throw new Error("de huidige rang is tijdens het formulier gewijzigd");
+  }
+
+  const targetIndex = getPromotionTargetIndex(
+    currentRankIndex,
+    record.promotionCount,
+  );
+
+  if (targetIndex === null) {
+    throw new Error("het gekozen aantal promoties past niet meer");
+  }
+
+  const targetRoleId = CONFIG.rankRoleIds[targetIndex];
+  const targetRole = interaction.guild.roles.cache.get(targetRoleId);
+  const oldRankRole = interaction.guild.roles.cache.get(currentRankId);
+
+  if (!member.manageable) {
+    throw new Error("de hoogste botrol staat niet boven dit lid");
+  }
+
+  if (
+    !targetRole ||
+    targetRole.managed ||
+    targetRole.position >= botMember.roles.highest.position
+  ) {
+    throw new Error("de nieuwe rang staat niet onder de hoogste botrol");
+  }
+
+  if (
+    !oldRankRole ||
+    oldRankRole.managed ||
+    oldRankRole.position >= botMember.roles.highest.position
+  ) {
+    throw new Error("de oude rang kan niet door de bot worden verwijderd");
+  }
+
+  const otherRankRoleIds = CONFIG.rankRoleIds.filter(
+    (roleId) => roleId !== targetRoleId && member.roles.cache.has(roleId),
+  );
+  const auditReason =
+    `${record.promotionCount} promotie(s) door ${interaction.user.tag} (${interaction.user.id})`.slice(
+      0,
+      512,
+    );
+
+  await member.roles.add(targetRoleId, auditReason);
+
+  try {
+    if (otherRankRoleIds.length > 0) {
+      await member.roles.remove(otherRankRoleIds, auditReason);
+    }
+  } catch (error) {
+    await member.roles.remove(targetRoleId, "Promotie teruggedraaid na fout").catch(
+      () => null,
+    );
+    throw error;
+  }
+
+  return {
+    memberId: member.id,
+    displayName: member.displayName,
+    oldRankId: currentRankId,
+    newRankId: targetRoleId,
+    promotionCount: record.promotionCount,
+  };
+}
+
+async function executePromotionSession(interaction, session) {
+  if (session.processing) {
+    throw new Error("Deze promoties worden al uitgevoerd.");
+  }
+
+  session.processing = true;
+  await interaction.deferUpdate();
+  await interaction.editReply({
+    content: "⏳ De rollen worden aangepast en de aankondiging wordt geplaatst...",
+    embeds: [],
+    components: [],
+  });
+
+  try {
+    await interaction.guild.roles.fetch();
+    const botMember =
+      interaction.guild.members.me ??
+      (await interaction.guild.members.fetchMe());
+    const channelPermissions = interaction.channel.permissionsFor(botMember);
+    const tagRole = interaction.guild.roles.cache.get(session.tagRoleId);
+
+    if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) {
+      throw new Error("De bot mist de machtiging `Rollen beheren`.");
+    }
+
+    if (
+      !channelPermissions?.has([
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.EmbedLinks,
+      ])
+    ) {
+      throw new Error(
+        "De bot kan in dit kanaal geen berichten en embeds meer plaatsen.",
+      );
+    }
+
+    if (!tagRole) {
+      throw new Error("De gekozen tagrol bestaat niet meer.");
+    }
+
+    if (
+      !tagRole.mentionable &&
+      !channelPermissions.has(PermissionFlagsBits.MentionEveryone)
+    ) {
+      throw new Error("De gekozen tagrol kan niet meer worden vermeld.");
+    }
+
+    const successes = [];
+    const failures = [];
+
+    for (const record of session.members) {
+      try {
+        successes.push(await applyPromotion(record, interaction, botMember));
+      } catch (error) {
+        failures.push(
+          `• <@${record.id}>: ${cleanEmbedValue(error.message || error, 300)}`,
+        );
+      }
+    }
+
+    if (successes.length > 0) {
+      const announcementEmbed = buildPromotionAnnouncementEmbed(
+        successes,
+        interaction,
+      );
+      const userMentions = successes
+        .map((result) => `<@${result.memberId}>`)
+        .join(" ");
+      const announcement = await interaction.channel.send({
+        content: `<@&${session.tagRoleId}> ${userMentions}`,
+        embeds: [announcementEmbed],
+        allowedMentions: {
+          roles: [session.tagRoleId],
+          users: successes.map((result) => result.memberId),
+        },
+      });
+
+      await announcement.edit({
+        content: `<@&${session.tagRoleId}>`,
+        embeds: [announcementEmbed],
+        allowedMentions: { parse: [] },
+      });
+    }
+
+    promotionSessions.delete(session.id);
+
+    const resultLines = [
+      successes.length > 0
+        ? `✅ ${successes.length} persoon/personen succesvol gepromoveerd.`
+        : "❌ Er is niemand gepromoveerd.",
+    ];
+
+    if (failures.length > 0) {
+      resultLines.push(
+        "",
+        `**Niet gelukt (${failures.length}):**`,
+        ...getLimitedPromotionLines(failures),
+      );
+    }
+
+    await interaction.editReply({
+      content: resultLines.join("\n"),
+      embeds: [],
+      components: [],
+      allowedMentions: { parse: [] },
+    });
+  } catch (error) {
+    session.processing = false;
+    promotionSessions.delete(session.id);
+    throw error;
+  }
+}
+
+async function handlePromotionComponent(interaction) {
+  try {
+    const { action, session } = getPromotionSession(interaction);
+
+    if (action === "users" && interaction.isUserSelectMenu()) {
+      await handlePromotionUserSelection(interaction, session);
+      return;
+    }
+
+    if (action === "count" && interaction.isStringSelectMenu()) {
+      await handlePromotionCountSelection(interaction, session);
+      return;
+    }
+
+    if (action === "confirm" && interaction.isButton()) {
+      await executePromotionSession(interaction, session);
+      return;
+    }
+
+    if (action === "cancel" && interaction.isButton()) {
+      promotionSessions.delete(session.id);
+      await interaction.update({
+        content: "✖️ Het promotieformulier is geannuleerd.",
+        embeds: [],
+        components: [],
+      });
+      return;
+    }
+
+    throw new Error("Deze knop of keuzelijst hoort niet bij deze stap.");
+  } catch (error) {
+    await replyPromotionComponentError(interaction, error);
+  }
 }
 
 async function handleSheetTestCommand(interaction) {
@@ -2811,32 +3462,44 @@ async function handleAbsenceCommand(interaction) {
 }
 
 client.on(Events.InteractionCreate, (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+  if (interaction.isChatInputCommand()) {
+    if (interaction.commandName === absenceCommand.name) {
+      void handleAbsenceCommand(interaction);
+    } else if (interaction.commandName === warningCommand.name) {
+      void handleWarningCommand(interaction);
+    } else if (interaction.commandName === warningRemoveCommand.name) {
+      void handleWarningRemoveCommand(interaction);
+    } else if (interaction.commandName === banCommand.name) {
+      void handleBanCommand(interaction);
+    } else if (interaction.commandName === unbanCommand.name) {
+      void handleUnbanCommand(interaction);
+    } else if (
+      interaction.commandName === refreshInactivityCommand.name ||
+      interaction.commandName === refreshActivityCommand.name
+    ) {
+      void handleDashboardRefreshCommand(interaction);
+    } else if (
+      interaction.commandName === resetInactivityCommand.name ||
+      interaction.commandName === resetActivityCommand.name
+    ) {
+      void handleDashboardResetCommand(interaction);
+    } else if (interaction.commandName === sheetTestCommand.name) {
+      void handleSheetTestCommand(interaction);
+    } else if (interaction.commandName === refreshAcceptedSheetCommand.name) {
+      void handleAcceptedRefreshCommand(interaction);
+    } else if (interaction.commandName === promotionCommand.name) {
+      void handlePromotionCommand(interaction);
+    }
+    return;
+  }
 
-  if (interaction.commandName === absenceCommand.name) {
-    void handleAbsenceCommand(interaction);
-  } else if (interaction.commandName === warningCommand.name) {
-    void handleWarningCommand(interaction);
-  } else if (interaction.commandName === warningRemoveCommand.name) {
-    void handleWarningRemoveCommand(interaction);
-  } else if (interaction.commandName === banCommand.name) {
-    void handleBanCommand(interaction);
-  } else if (interaction.commandName === unbanCommand.name) {
-    void handleUnbanCommand(interaction);
-  } else if (
-    interaction.commandName === refreshInactivityCommand.name ||
-    interaction.commandName === refreshActivityCommand.name
+  if (
+    (interaction.isUserSelectMenu() ||
+      interaction.isStringSelectMenu() ||
+      interaction.isButton()) &&
+    interaction.customId.startsWith("promo:")
   ) {
-    void handleDashboardRefreshCommand(interaction);
-  } else if (
-    interaction.commandName === resetInactivityCommand.name ||
-    interaction.commandName === resetActivityCommand.name
-  ) {
-    void handleDashboardResetCommand(interaction);
-  } else if (interaction.commandName === sheetTestCommand.name) {
-    void handleSheetTestCommand(interaction);
-  } else if (interaction.commandName === refreshAcceptedSheetCommand.name) {
-    void handleAcceptedRefreshCommand(interaction);
+    void handlePromotionComponent(interaction);
   }
 });
 
@@ -3043,6 +3706,7 @@ module.exports = {
   getMissedDays,
   getMemberRankId,
   getMentionedUserIds,
+  getPromotionTargetIndex,
   getInactivityDayCounts,
   getMonthStart,
   getMostRecentCompletedWeek,
