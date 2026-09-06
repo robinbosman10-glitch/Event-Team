@@ -2272,6 +2272,20 @@ function buildPromotionAnnouncementEmbed(successes, interaction) {
     ].join("\n"),
     inline: false,
   }));
+  const signature = [
+    `<@${CONFIG.promotionSignatureUserId}>`,
+    `<@&${CONFIG.promotionSignatureRoleId}>`,
+  ].join(" ");
+
+  if (fields.length < 25) {
+    fields.push({
+      name: "Met vriendelijke Groet,",
+      value: signature,
+      inline: false,
+    });
+  } else {
+    fields.at(-1).value += `\n\n**Met vriendelijke Groet,**\n${signature}`;
+  }
 
   const executorName =
     interaction.guild.members.cache.get(interaction.user.id)?.displayName ||
@@ -2295,17 +2309,6 @@ function buildPromotionAnnouncementEmbed(successes, interaction) {
   const guildIconUrl = interaction.guild.iconURL();
   if (guildIconUrl) embed.setThumbnail(guildIconUrl);
   return embed;
-}
-
-function buildPromotionSignatureEmbed() {
-  return new EmbedBuilder()
-    .setColor(0xfee75c)
-    .setDescription(
-      [
-        "### Met vriendelijke Groet,",
-        `<@${CONFIG.promotionSignatureUserId}> <@&${CONFIG.promotionSignatureRoleId}>`,
-      ].join("\n"),
-    );
 }
 
 async function applyPromotion(record, interaction, botMember) {
@@ -2446,13 +2449,12 @@ async function executePromotionSession(interaction, session) {
         successes,
         interaction,
       );
-      const signatureEmbed = buildPromotionSignatureEmbed();
       const userMentions = successes
         .map((result) => `<@${result.memberId}>`)
         .join(" ");
       const announcement = await interaction.channel.send({
         content: `<@&${session.tagRoleId}> ${userMentions}`,
-        embeds: [announcementEmbed, signatureEmbed],
+        embeds: [announcementEmbed],
         allowedMentions: {
           roles: [session.tagRoleId],
           users: successes.map((result) => result.memberId),
@@ -2461,7 +2463,7 @@ async function executePromotionSession(interaction, session) {
 
       await announcement.edit({
         content: `<@&${session.tagRoleId}>`,
-        embeds: [announcementEmbed, signatureEmbed],
+        embeds: [announcementEmbed],
         allowedMentions: { parse: [] },
       });
     }
