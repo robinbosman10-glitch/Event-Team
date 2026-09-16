@@ -89,6 +89,7 @@ const CONFIG = Object.freeze({
   removedAbsenceMarker: "AFR-AFWEZIG-VERWIJDERD",
   absenceApprovalMarker: "AFR-AFWEZIGHEID-GOEDKEURING",
   absenceApprovalStartTimestamp: Date.UTC(2026, 8, 16),
+  absenceFormSessionMs: 15 * 60 * 1000,
   approvedAbsenceRoleId: "1549874222002741318",
   absenceLogUserId: "424086753327054849",
   blacklistMarker: "AFR-BLACKLIST",
@@ -96,48 +97,20 @@ const CONFIG = Object.freeze({
 
 const absenceCommand = new SlashCommandBuilder()
   .setName("afwezig")
-  .setDescription("Beheer handmatige afwezigheden.")
-  .setDefaultMemberPermissions(0)
+  .setDescription("Dien voor één of meerdere personen een afwezigheid in.")
+  .setDefaultMemberPermissions(null)
+  .setDMPermission(false);
+
+const absenceRemoveCommand = new SlashCommandBuilder()
+  .setName("afwezigverwijderen")
+  .setDescription("Haal iemand handmatig uit de afwezigheidslijst.")
+  .setDefaultMemberPermissions(null)
   .setDMPermission(false)
-  .addSubcommand((subcommand) =>
-    subcommand
-      .setName("toevoegen")
-      .setDescription("Voeg iemand handmatig aan de afwezigheidslijst toe.")
-      .addUserOption((option) =>
-        option
-          .setName("persoon")
-          .setDescription("De persoon die afwezig is.")
-          .setRequired(true),
-      )
-      .addStringOption((option) =>
-        option
-          .setName("begin")
-          .setDescription("Begindatum en -tijd: DD-MM-JJJJ UU:MM")
-          .setRequired(true),
-      )
-      .addStringOption((option) =>
-        option
-          .setName("einde")
-          .setDescription("Einddatum en -tijd: DD-MM-JJJJ UU:MM")
-          .setRequired(true),
-      )
-      .addStringOption((option) =>
-        option
-          .setName("reden")
-          .setDescription("De reden van de afwezigheid.")
-          .setRequired(false),
-      ),
-  )
-  .addSubcommand((subcommand) =>
-    subcommand
-      .setName("verwijderen")
-      .setDescription("Haal iemand handmatig uit de afwezigheidslijst.")
-      .addUserOption((option) =>
-        option
-          .setName("persoon")
-          .setDescription("De persoon die uit de afwezigheidslijst moet.")
-          .setRequired(true),
-      ),
+  .addUserOption((option) =>
+    option
+      .setName("persoon")
+      .setDescription("De persoon die uit de afwezigheidslijst moet.")
+      .setRequired(true),
   );
 
 const warningCommand = new SlashCommandBuilder()
@@ -314,6 +287,7 @@ const dashboardMessagesByMarker = new Map();
 const dashboardResetTimestamps = new Map();
 const blacklistUserIds = new Set();
 const promotionSessions = new Map();
+const absenceFormSessions = new Map();
 const absenceApprovalSourceIds = new Set();
 const absenceApprovalProcessingIds = new Set();
 const approvedAbsencesByMessageId = new Map();
@@ -1249,6 +1223,93 @@ function buildAbsenceNoteModal(messageId) {
     .setCustomId(`absence-approval:note-modal:${messageId}`)
     .setTitle("Opmerking toevoegen")
     .addComponents(new ActionRowBuilder().addComponents(noteInput));
+}
+
+function createAbsenceFormSession(interaction) {
+  const id = randomUUID();
+  const session = {
+    id,
+    ownerId: interaction.user.id,
+    guildId: interaction.guildId,
+    channelId: interaction.channelId,
+    userIds: [],
+    skippedUserIds: [],
+    expiresAt: Date.now() + CONFIG.absenceFormSessionMs,
+  };
+
+  absenceFormSessions.set(id, session);
+  const timeout = setTimeout(
+    () => absenceFormSessions.delete(id),
+    CONFIG.absenceFormSessionMs,
+  );
+  timeout.unref?.();
+  return session;
+}
+
+function getAbsenceFormSession(interaction, sessionId) {
+  const session = absenceFormSessions.get(sessionId);
+
+  if (!session || session.expiresAt <= Date.now()) {
+    if (session) absenceFormSessions.delete(sessionId);
+    throw new Error(
+      "Dit formulier is verlopen. Gebruik `/afwezig` om opnieuw te beginnen.",
+    );
+  }
+
+  if (
+    session.ownerId !== interaction.user.id ||
+    session.guildId !== interaction.guildId ||
+    session.channelId !== interaction.channelId
+  ) {
+    throw new Error("Dit afwezigheidsformulier is niet voor jou bedoeld.");
+  }
+
+  return session;
+}
+
+function buildAbsenceUserSelectRow(sessionId) {
+  const userSelect = new UserSelectMenuBuilder()
+    .setCustomId(`absence-form:users:${sessionId}`)
+    .setPlaceholder("Kies 1 tot 25 afwezige personen")
+    .setMinValues(1)
+    .setMaxValues(25);
+
+  return new ActionRowBuilder().addComponents(userSelect);
+}
+
+function buildAbsenceDetailsModal(sessionId, selectedCount) {
+  const reasonInput = new TextInputBuilder()
+    .setCustomId("reason")
+    .setLabel("Reden")
+    .setStyle(TextInputStyle.Paragraph)
+    .setPlaceholder("Waarom zijn deze personen afwezig?")
+    .setRequired(true)
+    .setMaxLength(500);
+  const startDateInput = new TextInputBuilder()
+    .setCustomId("start_date")
+    .setLabel("Begindatum (DD-MM-JJJJ)")
+    .setStyle(TextInputStyle.Short)
+    .setPlaceholder("16-09-2026")
+    .setRequired(true)
+    .setMaxLength(10);
+  const endDateInput = new TextInputBuilder()
+    .setCustomId("end_date")
+    .setLabel("Einddatum (DD-MM-JJJJ)")
+    .setStyle(TextInputStyle.Short)
+    .setPlaceholder("20-09-2026")
+    .setRequired(true)
+    .setMaxLength(10);
+
+  return new ModalBuilder()
+    .setCustomId(`absence-form:details:${sessionId}`)
+    .setTitle(`Afwezigheid voor ${selectedCount} perso${
+      selectedCount === 1 ? "on" : "nen"
+    }`)
+    .addComponents(
+      new ActionRowBuilder().addComponents(reasonInput),
+      new ActionRowBuilder().addComponents(startDateInput),
+      new ActionRowBuilder().addComponents(endDateInput),
+    );
 }
 
 function buildPendingAbsenceEmbed(record, message) {
@@ -2584,6 +2645,7 @@ async function registerCommands(guild) {
   const commands = await guild.commands.fetch();
   const commandBuilders = [
     absenceCommand,
+    absenceRemoveCommand,
     warningCommand,
     warningRemoveCommand,
     banCommand,
@@ -2611,7 +2673,7 @@ async function registerCommands(guild) {
   }
 
   console.log(
-    "Slash-commands /afwezig, /warn, /warnweg, /ban, /unban, /werkbijinactiviteit, /werkbijactiviteit, /resetinactiviteit, /resetactiviteit, /sheettest, /werkaangenomen en /promotie zijn geregistreerd.",
+    "Slash-commands /afwezig, /afwezigverwijderen, /warn, /warnweg, /ban, /unban, /werkbijinactiviteit, /werkbijactiviteit, /resetinactiviteit, /resetactiviteit, /sheettest, /werkaangenomen en /promotie zijn geregistreerd.",
   );
 }
 
@@ -4698,18 +4760,14 @@ async function handleDashboardResetCommand(interaction) {
   );
 }
 
-async function getTrackedTargetMember(interaction) {
+async function getAbsenceTargetMember(interaction) {
   const user = interaction.options.getUser("persoon", true);
   const member =
     interaction.guild.members.cache.get(user.id) ??
     (await interaction.guild.members.fetch(user.id));
 
-  if (
-    user.bot ||
-    CONFIG.excludedUserIds.includes(user.id) ||
-    !CONFIG.rankRoleIds.some((roleId) => member.roles.cache.has(roleId))
-  ) {
-    throw new Error("Deze persoon staat niet in de gekoppelde rollenlijst.");
+  if (user.bot) {
+    throw new Error("Een bot kan niet als afwezig worden geregistreerd.");
   }
 
   return member;
@@ -4719,6 +4777,268 @@ async function handleAbsenceCommand(interaction) {
   if (
     !interaction.isChatInputCommand() ||
     interaction.commandName !== absenceCommand.name
+  ) {
+    return;
+  }
+
+  try {
+    if (!interaction.inGuild()) {
+      throw new Error("Deze command werkt alleen in de Discord-server.");
+    }
+
+    const session = createAbsenceFormSession(interaction);
+    await interaction.reply({
+      content:
+        "Selecteer alle personen voor wie je dezelfde reden en periode wilt indienen. Daarna opent automatisch het formulier.",
+      components: [buildAbsenceUserSelectRow(session.id)],
+      flags: MessageFlags.Ephemeral,
+    });
+  } catch (error) {
+    const content = `❌ ${error.message}`;
+
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
+    } else {
+      await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+    }
+  }
+}
+
+async function handleAbsenceFormUserSelection(interaction) {
+  if (
+    !interaction.isUserSelectMenu() ||
+    !interaction.customId.startsWith("absence-form:users:")
+  ) {
+    return;
+  }
+
+  try {
+    if (!interaction.inGuild()) {
+      throw new Error("Dit formulier werkt alleen in de Discord-server.");
+    }
+
+    const sessionId = interaction.customId.slice(
+      "absence-form:users:".length,
+    );
+    const session = getAbsenceFormSession(interaction, sessionId);
+    const validUserIds = [];
+    const skippedUserIds = [];
+
+    for (const userId of [...new Set(interaction.values)]) {
+      const user = interaction.users.get(userId);
+      const member =
+        interaction.guild.members.cache.get(userId) ??
+        (await interaction.guild.members.fetch(userId).catch(() => null));
+
+      if (!user || user.bot || !member) {
+        skippedUserIds.push(userId);
+      } else {
+        validUserIds.push(userId);
+      }
+    }
+
+    if (!validUserIds.length) {
+      throw new Error("Selecteer minimaal één persoon die in de server zit.");
+    }
+
+    session.userIds = validUserIds;
+    session.skippedUserIds = skippedUserIds;
+    await interaction.showModal(
+      buildAbsenceDetailsModal(session.id, validUserIds.length),
+    );
+  } catch (error) {
+    const content = `❌ ${error.message}`;
+
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
+    } else {
+      await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+    }
+  }
+}
+
+async function handleAbsenceFormModal(interaction) {
+  if (
+    !interaction.isModalSubmit() ||
+    !interaction.customId.startsWith("absence-form:details:")
+  ) {
+    return;
+  }
+
+  let session;
+  let sessionRemoved = false;
+
+  try {
+    if (!interaction.inGuild()) {
+      throw new Error("Dit formulier werkt alleen in de Discord-server.");
+    }
+
+    const sessionId = interaction.customId.slice(
+      "absence-form:details:".length,
+    );
+    session = getAbsenceFormSession(interaction, sessionId);
+
+    if (!session.userIds.length) {
+      throw new Error("Er zijn geen geldige personen geselecteerd.");
+    }
+
+    if (session.processing) {
+      throw new Error("Dit formulier wordt al verwerkt.");
+    }
+
+    session.processing = true;
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const reason = interaction.fields.getTextInputValue("reason").trim();
+    const start = parseDutchDateTime(
+      interaction.fields.getTextInputValue("start_date").trim(),
+      "",
+      false,
+    );
+    const end = parseDutchDateTime(
+      interaction.fields.getTextInputValue("end_date").trim(),
+      "",
+      true,
+    );
+
+    if (!start || !end) {
+      throw new Error("Gebruik voor beide datums het formaat `DD-MM-JJJJ`.");
+    }
+
+    if (end < start) {
+      throw new Error("De einddatum mag niet vóór de begindatum liggen.");
+    }
+
+    if (end < new Date()) {
+      throw new Error("De ingevulde afwezigheid is al volledig afgelopen.");
+    }
+
+    const absenceChannel = await client.channels.fetch(CONFIG.absenceChannelId);
+
+    if (!absenceChannel?.isTextBased() || !absenceChannel.messages) {
+      throw new Error("Het afwezigheidskanaal is geen tekstkanaal.");
+    }
+
+    absenceFormSessions.delete(session.id);
+    sessionRemoved = true;
+
+    const createdUserIds = [];
+    const overlappingUserIds = [];
+    const failedUserIds = [];
+
+    for (const userId of session.userIds) {
+      const record = {
+        userId,
+        tagId: session.ownerId,
+        reason: reason || "Geen reden opgegeven",
+        start,
+        end,
+        sourceTimestamp: interaction.createdTimestamp,
+        cancelled: false,
+      };
+      const overlap = findOverlappingAbsenceRequest(record);
+
+      if (overlap) {
+        overlappingUserIds.push(userId);
+        continue;
+      }
+
+      try {
+        const pendingMessage = await absenceChannel.send({
+          embeds: [
+            buildPendingAbsenceEmbed(record, {
+              author: { id: session.ownerId },
+              id: interaction.id,
+              createdTimestamp: interaction.createdTimestamp,
+            }),
+          ],
+          components: [buildAbsenceApprovalButtons()],
+          allowedMentions: { parse: [] },
+        });
+
+        pendingAbsencesByMessageId.set(pendingMessage.id, {
+          ...record,
+          requesterId: session.ownerId,
+        });
+        createdUserIds.push(userId);
+        queueAbsenceLog(
+          interaction.guild,
+          "⏳ Nieuwe afwezigheidsaanvraag",
+          0xfee75c,
+          [
+            `**Persoon:** <@${userId}>`,
+            `**Ingediend door:** <@${session.ownerId}>`,
+            `**Periode:** <t:${Math.floor(start.getTime() / 1_000)}:D> t/m <t:${Math.floor(end.getTime() / 1_000)}:D>`,
+            `**Reden:** ${cleanEmbedValue(reason, 500)}`,
+            `**Aanvraag:** [Open bericht](${pendingMessage.url})`,
+          ],
+        );
+      } catch (error) {
+        failedUserIds.push(userId);
+        console.error(
+          `Afwezigheidsformulier voor ${userId} kon niet worden aangemaakt:`,
+          error,
+        );
+      }
+    }
+
+    const summaryLines = [];
+
+    if (createdUserIds.length) {
+      summaryLines.push(
+        `✅ ${createdUserIds.length} aanvraag${createdUserIds.length === 1 ? "" : "en"} aangemaakt voor ${createdUserIds.map((userId) => `<@${userId}>`).join(", ")}.`,
+        "Een serverbeheerder kan iedere persoon apart goedkeuren of afkeuren.",
+      );
+    }
+
+    if (overlappingUserIds.length) {
+      summaryLines.push(
+        `⚠️ Niet dubbel ingediend wegens een overlappende aanvraag: ${overlappingUserIds.map((userId) => `<@${userId}>`).join(", ")}.`,
+      );
+    }
+
+    if (session.skippedUserIds.length) {
+      summaryLines.push(
+        `⚠️ Overgeslagen omdat het geen geldig serverlid is: ${session.skippedUserIds.map((userId) => `<@${userId}>`).join(", ")}.`,
+      );
+    }
+
+    if (failedUserIds.length) {
+      summaryLines.push(
+        `❌ Technisch mislukt voor: ${failedUserIds.map((userId) => `<@${userId}>`).join(", ")}.`,
+      );
+    }
+
+    if (!summaryLines.length) {
+      summaryLines.push("ℹ️ Er zijn geen nieuwe aanvragen aangemaakt.");
+    }
+
+    await interaction.message
+      ?.edit({
+        content: "✅ Het afwezigheidsformulier is verwerkt.",
+        components: [],
+      })
+      .catch(() => null);
+    await interaction.editReply({
+      content: summaryLines.join("\n"),
+      allowedMentions: { parse: [] },
+    });
+  } catch (error) {
+    if (session && !sessionRemoved) session.processing = false;
+    const content = `❌ ${error.message}`;
+
+    if (interaction.replied || interaction.deferred) {
+      await interaction.editReply(content);
+    } else {
+      await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+    }
+  }
+}
+
+async function handleAbsenceRemovalCommand(interaction) {
+  if (
+    !interaction.isChatInputCommand() ||
+    interaction.commandName !== absenceRemoveCommand.name
   ) {
     return;
   }
@@ -4733,71 +5053,24 @@ async function handleAbsenceCommand(interaction) {
     const executor =
       interaction.guild.members.cache.get(interaction.user.id) ??
       (await interaction.guild.members.fetch(interaction.user.id));
+    const isAdministrator = interaction.memberPermissions?.has(
+      PermissionFlagsBits.Administrator,
+    );
 
-    if (!executor.roles.cache.has(CONFIG.absenceCommandRoleId)) {
+    if (
+      !isAdministrator &&
+      !executor.roles.cache.has(CONFIG.absenceCommandRoleId)
+    ) {
       throw new Error(
-        `Alleen leden met <@&${CONFIG.absenceCommandRoleId}> mogen deze command gebruiken.`,
+        `Alleen serverbeheerders of leden met <@&${CONFIG.absenceCommandRoleId}> mogen deze command gebruiken.`,
       );
     }
 
-    const targetMember = await getTrackedTargetMember(interaction);
+    const targetMember = await getAbsenceTargetMember(interaction);
     const absenceChannel = await client.channels.fetch(CONFIG.absenceChannelId);
 
     if (!absenceChannel?.isTextBased() || !absenceChannel.messages) {
       throw new Error("Het afwezigheidskanaal is geen tekstkanaal.");
-    }
-
-    const subcommand = interaction.options.getSubcommand();
-
-    if (subcommand === "toevoegen") {
-      const start = parseCommandDateTime(
-        interaction.options.getString("begin", true),
-      );
-      const end = parseCommandDateTime(
-        interaction.options.getString("einde", true),
-      );
-
-      if (!start || !end) {
-        throw new Error(
-          "Gebruik voor begin en einde het formaat `DD-MM-JJJJ UU:MM`.",
-        );
-      }
-
-      if (end <= start) {
-        throw new Error("De einddatum en -tijd moeten na het begin liggen.");
-      }
-
-      const reason =
-        interaction.options.getString("reden")?.trim() ||
-        "Geen reden opgegeven";
-      const formEmbed = new EmbedBuilder()
-        .setColor(0x9b59b6)
-        .setTitle("| Afmeldingsformulier")
-        .setDescription(
-          [
-            `> **Naam:** <@${targetMember.id}>`,
-            `> **Reden:** ${reason.slice(0, 500)}`,
-            `> **Begin datum:** ${formatLocalDate(start)}`,
-            `> **Begin tijd:** ${formatLocalTime(start)}`,
-            `> **Eind datum:** ${formatLocalDate(end)}`,
-            `> **Eind tijd:** ${formatLocalTime(end)}`,
-            `> **Tag:** <@${interaction.user.id}>`,
-          ].join("\n"),
-        )
-        .setFooter({
-          text: `${CONFIG.manualAbsenceMarker}:${targetMember.id}`,
-        })
-        .setTimestamp();
-
-      await absenceChannel.send({
-        embeds: [formEmbed],
-        allowedMentions: { parse: [] },
-      });
-      await refreshDashboard();
-      await interaction.editReply(
-        `De afwezigheid van <@${targetMember.id}> is toegevoegd van <t:${Math.floor(start.getTime() / 1_000)}:f> tot <t:${Math.floor(end.getTime() / 1_000)}:f>.`,
-      );
-      return;
     }
 
     const monthStart = getMonthStart();
@@ -4921,6 +5194,8 @@ client.on(Events.InteractionCreate, (interaction) => {
   if (interaction.isChatInputCommand()) {
     if (interaction.commandName === absenceCommand.name) {
       void handleAbsenceCommand(interaction);
+    } else if (interaction.commandName === absenceRemoveCommand.name) {
+      void handleAbsenceRemovalCommand(interaction);
     } else if (interaction.commandName === warningCommand.name) {
       void handleWarningCommand(interaction);
     } else if (interaction.commandName === warningRemoveCommand.name) {
@@ -4946,6 +5221,22 @@ client.on(Events.InteractionCreate, (interaction) => {
     } else if (interaction.commandName === promotionCommand.name) {
       void handlePromotionCommand(interaction);
     }
+    return;
+  }
+
+  if (
+    interaction.isUserSelectMenu() &&
+    interaction.customId.startsWith("absence-form:")
+  ) {
+    void handleAbsenceFormUserSelection(interaction);
+    return;
+  }
+
+  if (
+    interaction.isModalSubmit() &&
+    interaction.customId.startsWith("absence-form:")
+  ) {
+    void handleAbsenceFormModal(interaction);
     return;
   }
 
@@ -5245,6 +5536,11 @@ function startBot() {
 if (require.main === module) void startBot();
 
 module.exports = {
+  absenceCommand,
+  absenceRemoveCommand,
+  buildAbsenceDetailsModal,
+  buildAbsenceUserSelectRow,
+  buildPendingAbsenceEmbed,
   collectAttendance,
   collectAbsenceRecords,
   collectLatestActivity,
@@ -5266,4 +5562,5 @@ module.exports = {
   parseAcceptedMemberMessage,
   parseAcceptedMemberMessages,
   parseCommandDateTime,
+  parseDutchDateTime,
 };
