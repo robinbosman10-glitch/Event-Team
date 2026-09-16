@@ -310,6 +310,7 @@ const dashboardResetTimestamps = new Map();
 const blacklistUserIds = new Set();
 const promotionSessions = new Map();
 const absenceApprovalSourceIds = new Set();
+const absenceApprovalProcessingIds = new Set();
 let refreshInProgress = false;
 let dashboardGuildId = null;
 let archiveTestSentThisSession = false;
@@ -1157,7 +1158,14 @@ async function migrateUnprocessedAbsenceTemplates(guild) {
     );
 
   for (const message of sourceMessages) {
-    if (await processAbsenceTemplateMessage(message)) convertedCount += 1;
+    try {
+      if (await processAbsenceTemplateMessage(message)) convertedCount += 1;
+    } catch (error) {
+      console.error(
+        `Openstaande afwezigheidstemplate ${message.id} kon niet worden omgezet:`,
+        error,
+      );
+    }
   }
 
   console.log(
@@ -2867,6 +2875,17 @@ async function handleAbsenceApprovalInteraction(interaction) {
     return;
   }
 
+  if (
+    interaction.channelId !== CONFIG.absenceChannelId ||
+    interaction.message.author.id !== client.user.id
+  ) {
+    await interaction.reply({
+      content: "❌ Dit is geen geldig afmeldingsformulier van deze bot.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
   const approvalData = getAbsenceApprovalData(interaction.message);
 
   if (!approvalData) {
@@ -2885,62 +2904,76 @@ async function handleAbsenceApprovalInteraction(interaction) {
     return;
   }
 
-  const record = parseAbsenceForm(interaction.message);
-
-  if (!record) {
+  if (absenceApprovalProcessingIds.has(interaction.message.id)) {
     await interaction.reply({
-      content:
-        "❌ Dit formulier bevat geen geldige naam, begin- of einddatum.",
+      content: "⏳ Dit formulier wordt al door een beheerder verwerkt.",
       flags: MessageFlags.Ephemeral,
     });
     return;
   }
 
-  const action = interaction.customId.split(":")[1];
+  absenceApprovalProcessingIds.add(interaction.message.id);
 
-  if (!["approve", "reject"].includes(action)) {
-    await interaction.reply({
-      content: "❌ Onbekende beoordelingsactie.",
-      flags: MessageFlags.Ephemeral,
+  try {
+    const record = parseAbsenceForm(interaction.message);
+
+    if (!record) {
+      await interaction.reply({
+        content:
+          "❌ Dit formulier bevat geen geldige naam, begin- of einddatum.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const action = interaction.customId.split(":")[1];
+
+    if (!["approve", "reject"].includes(action)) {
+      await interaction.reply({
+        content: "❌ Onbekende beoordelingsactie.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const approved = action === "approve";
+    const status = approved ? "approved" : "rejected";
+    const statusText = approved
+      ? `✅ Goedgekeurd door <@${interaction.user.id}>`
+      : `❌ Afgekeurd door <@${interaction.user.id}>`;
+    const sourceEmbed = approvalData.embed;
+    const updatedDescription = String(sourceEmbed.description || "").replace(
+      /> \*\*Status:\*\*.*$/m,
+      `> **Status:** ${statusText}`,
+    );
+    const updatedEmbed = new EmbedBuilder(sourceEmbed.toJSON())
+      .setColor(approved ? 0x57f287 : 0xed4245)
+      .setTitle(
+        approved
+          ? "✅ Afmeldingsformulier — goedgekeurd"
+          : "❌ Afmeldingsformulier — afgekeurd",
+      )
+      .setDescription(updatedDescription)
+      .setFooter({
+        text: getAbsenceApprovalFooter(
+          status,
+          approvalData.userId,
+          approvalData.requesterId,
+          approvalData.sourceMessageId,
+          interaction.user.id,
+        ),
+      })
+      .setTimestamp();
+
+    await interaction.update({
+      embeds: [updatedEmbed],
+      components: [],
+      allowedMentions: { parse: [] },
     });
-    return;
+    void refreshDashboard("inactivity");
+  } finally {
+    absenceApprovalProcessingIds.delete(interaction.message.id);
   }
-
-  const approved = action === "approve";
-  const status = approved ? "approved" : "rejected";
-  const statusText = approved
-    ? `✅ Goedgekeurd door <@${interaction.user.id}>`
-    : `❌ Afgekeurd door <@${interaction.user.id}>`;
-  const sourceEmbed = approvalData.embed;
-  const updatedDescription = String(sourceEmbed.description || "").replace(
-    /> \*\*Status:\*\*.*$/m,
-    `> **Status:** ${statusText}`,
-  );
-  const updatedEmbed = new EmbedBuilder(sourceEmbed.toJSON())
-    .setColor(approved ? 0x57f287 : 0xed4245)
-    .setTitle(
-      approved
-        ? "✅ Afmeldingsformulier — goedgekeurd"
-        : "❌ Afmeldingsformulier — afgekeurd",
-    )
-    .setDescription(updatedDescription)
-    .setFooter({
-      text: getAbsenceApprovalFooter(
-        status,
-        approvalData.userId,
-        approvalData.requesterId,
-        approvalData.sourceMessageId,
-        interaction.user.id,
-      ),
-    })
-    .setTimestamp();
-
-  await interaction.update({
-    embeds: [updatedEmbed],
-    components: [],
-    allowedMentions: { parse: [] },
-  });
-  void refreshDashboard("inactivity");
 }
 
 async function handleSheetTestCommand(interaction) {
