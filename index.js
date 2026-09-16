@@ -1276,21 +1276,18 @@ function buildAbsenceDetailsModal(sessionId) {
     .setRequired(true);
   const reasonInput = new TextInputBuilder()
     .setCustomId("reason")
-    .setLabel("Reden")
     .setStyle(TextInputStyle.Paragraph)
     .setPlaceholder("Waarom ben je afwezig?")
     .setRequired(true)
     .setMaxLength(500);
   const startDateInput = new TextInputBuilder()
     .setCustomId("start_date")
-    .setLabel("Begindatum (DD-MM-JJJJ)")
     .setStyle(TextInputStyle.Short)
     .setPlaceholder("16-09-2026")
     .setRequired(true)
     .setMaxLength(10);
   const endDateInput = new TextInputBuilder()
     .setCustomId("end_date")
-    .setLabel("Einddatum (DD-MM-JJJJ)")
     .setStyle(TextInputStyle.Short)
     .setPlaceholder("20-09-2026")
     .setRequired(true)
