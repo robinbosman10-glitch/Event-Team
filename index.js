@@ -10,10 +10,13 @@ const {
   Events,
   GatewayIntentBits,
   MessageFlags,
+  ModalBuilder,
   Partials,
   PermissionFlagsBits,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   UserSelectMenuBuilder,
 } = require("discord.js");
 
@@ -87,6 +90,7 @@ const CONFIG = Object.freeze({
   absenceApprovalMarker: "AFR-AFWEZIGHEID-GOEDKEURING",
   absenceApprovalStartTimestamp: Date.UTC(2026, 8, 16),
   approvedAbsenceRoleId: "1549874222002741318",
+  absenceLogUserId: "424086753327054849",
   blacklistMarker: "AFR-BLACKLIST",
 });
 
@@ -313,6 +317,7 @@ const promotionSessions = new Map();
 const absenceApprovalSourceIds = new Set();
 const absenceApprovalProcessingIds = new Set();
 const approvedAbsencesByMessageId = new Map();
+const pendingAbsencesByMessageId = new Map();
 let refreshInProgress = false;
 let dashboardGuildId = null;
 let archiveTestSentThisSession = false;
@@ -1017,7 +1022,7 @@ function getAbsenceApprovalData(message) {
     const footerText = embed.footer?.text || "";
     const markerMatch = footerText.match(
       new RegExp(
-        `^${CONFIG.absenceApprovalMarker}\\|(pending|approved|rejected)\\|(\\d{17,20})\\|(\\d{17,20})\\|(\\d{17,20})(?:\\|(\\d{17,20}))?$`,
+        `^${CONFIG.absenceApprovalMarker}\\|(pending|approved|rejected|withdrawn)\\|(\\d{17,20})\\|(\\d{17,20})\\|(\\d{17,20})(?:\\|(\\d{17,20}))?$`,
         "i",
       ),
     );
@@ -1054,6 +1059,123 @@ function getAbsenceApprovalFooter(
   ].join("|");
 }
 
+function validateNewAbsenceForm(message, now = new Date()) {
+  const text = getMessageText(message);
+  const userId = getFormValue(text, "Naam").match(/<@!?(\d{17,20})>/)?.[1];
+  const tagId = getFormValue(text, "Tag").match(/<@!?(\d{17,20})>/)?.[1];
+  const beginDateText = getFormValue(text, "Begin datum");
+  const endDateText = getFormValue(text, "Eind datum");
+
+  if (!userId) {
+    return { error: "Vul bij `Naam` een geldige Discord-vermelding in." };
+  }
+
+  if (!beginDateText || !endDateText) {
+    return { error: "Vul zowel `Begin datum` als `Eind datum` in." };
+  }
+
+  const beginDateOnly = beginDateText.match(
+    /\d{1,2}[/-]\d{1,2}[/-]\d{4}/,
+  )?.[0];
+  const endDateOnly = endDateText.match(
+    /\d{1,2}[/-]\d{1,2}[/-]\d{4}/,
+  )?.[0];
+  const start = parseDutchDateTime(beginDateOnly, "", false);
+  const end = parseDutchDateTime(endDateOnly, "", true);
+
+  if (!start || !end) {
+    return { error: "Gebruik voor de datums het formaat `DD-MM-JJJJ`." };
+  }
+
+  if (end < start) {
+    return { error: "De einddatum mag niet vóór de begindatum liggen." };
+  }
+
+  if (end < now) {
+    return { error: "De ingevulde afwezigheid is al volledig afgelopen." };
+  }
+
+  return {
+    record: {
+      userId,
+      tagId,
+      reason: getFormValue(text, "Reden") || "Geen reden opgegeven",
+      start,
+      end,
+      sourceTimestamp: message.createdTimestamp,
+      cancelled: false,
+    },
+  };
+}
+
+function getAutomaticAbsenceStatus(record, now = new Date()) {
+  if (now < record.start) {
+    return {
+      key: "planned",
+      label: "Gepland",
+      emoji: "🗓️",
+      color: 0x5865f2,
+    };
+  }
+
+  if (now <= record.end) {
+    return {
+      key: "active",
+      label: "Momenteel afwezig",
+      emoji: "🛌",
+      color: 0x9b59b6,
+    };
+  }
+
+  return {
+    key: "ended",
+    label: "Afgelopen",
+    emoji: "⚪",
+    color: 0x95a5a6,
+  };
+}
+
+function findOverlappingAbsenceRequest(record, ignoredMessageId = null) {
+  for (const requests of [
+    pendingAbsencesByMessageId,
+    approvedAbsencesByMessageId,
+  ]) {
+    for (const [messageId, existingRecord] of requests) {
+      if (
+        messageId !== ignoredMessageId &&
+        existingRecord.userId === record.userId &&
+        record.start <= existingRecord.end &&
+        record.end >= existingRecord.start
+      ) {
+        return { messageId, record: existingRecord };
+      }
+    }
+  }
+
+  return null;
+}
+
+async function sendAbsenceLog(guild, title, color, lines) {
+  const logUser = await client.users.fetch(CONFIG.absenceLogUserId);
+  const embed = new EmbedBuilder()
+    .setColor(color)
+    .setTitle(title)
+    .setDescription(lines.join("\n"))
+    .setFooter({ text: guild.name })
+    .setTimestamp();
+
+  await logUser.send({
+    embeds: [embed],
+    allowedMentions: { parse: [] },
+  });
+}
+
+function queueAbsenceLog(guild, title, color, lines) {
+  void sendAbsenceLog(guild, title, color, lines).catch((error) => {
+    console.error("Afwezigheidslog kon niet via DM worden verstuurd:", error);
+  });
+}
+
 function buildAbsenceApprovalButtons() {
   const approveButton = new ButtonBuilder()
     .setCustomId("absence-approval:approve")
@@ -1065,8 +1187,68 @@ function buildAbsenceApprovalButtons() {
     .setLabel("Afkeuren")
     .setEmoji("✖️")
     .setStyle(ButtonStyle.Danger);
+  const withdrawButton = new ButtonBuilder()
+    .setCustomId("absence-approval:withdraw")
+    .setLabel("Intrekken")
+    .setEmoji("↩️")
+    .setStyle(ButtonStyle.Secondary);
+  const noteButton = new ButtonBuilder()
+    .setCustomId("absence-approval:note")
+    .setLabel("Opmerking beheerder")
+    .setEmoji("📝")
+    .setStyle(ButtonStyle.Primary);
 
-  return new ActionRowBuilder().addComponents(approveButton, rejectButton);
+  return new ActionRowBuilder().addComponents(
+    approveButton,
+    rejectButton,
+    withdrawButton,
+    noteButton,
+  );
+}
+
+function buildApprovedAbsenceButtons() {
+  const extendButton = new ButtonBuilder()
+    .setCustomId("absence-approval:extend")
+    .setLabel("Verlengen")
+    .setEmoji("📅")
+    .setStyle(ButtonStyle.Success);
+  const noteButton = new ButtonBuilder()
+    .setCustomId("absence-approval:note")
+    .setLabel("Opmerking beheerder")
+    .setEmoji("📝")
+    .setStyle(ButtonStyle.Primary);
+
+  return new ActionRowBuilder().addComponents(extendButton, noteButton);
+}
+
+function buildAbsenceExtensionModal(messageId, currentEnd) {
+  const endDateInput = new TextInputBuilder()
+    .setCustomId("new_end_date")
+    .setLabel("Nieuwe einddatum (DD-MM-JJJJ)")
+    .setStyle(TextInputStyle.Short)
+    .setValue(formatLocalDate(currentEnd))
+    .setRequired(true)
+    .setMaxLength(10);
+
+  return new ModalBuilder()
+    .setCustomId(`absence-approval:extend-modal:${messageId}`)
+    .setTitle("Afwezigheid verlengen")
+    .addComponents(new ActionRowBuilder().addComponents(endDateInput));
+}
+
+function buildAbsenceNoteModal(messageId) {
+  const noteInput = new TextInputBuilder()
+    .setCustomId("admin_note")
+    .setLabel("Opmerking beheerder")
+    .setStyle(TextInputStyle.Paragraph)
+    .setPlaceholder("Schrijf hier de opmerking voor de aanvrager...")
+    .setRequired(true)
+    .setMaxLength(500);
+
+  return new ModalBuilder()
+    .setCustomId(`absence-approval:note-modal:${messageId}`)
+    .setTitle("Opmerking toevoegen")
+    .addComponents(new ActionRowBuilder().addComponents(noteInput));
 }
 
 function buildPendingAbsenceEmbed(record, message) {
@@ -1107,9 +1289,78 @@ async function processAbsenceTemplateMessage(message) {
     return false;
   }
 
-  const record = parseAbsenceForm(fullMessage);
+  const messageText = getMessageText(fullMessage);
 
-  if (!record) return false;
+  if (!/afmeldingsformulier/i.test(messageText)) return false;
+
+  const validation = validateNewAbsenceForm(fullMessage);
+
+  if (validation.error) {
+    await fullMessage.channel.send({
+      content: `<@${fullMessage.author.id}>`,
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0xed4245)
+          .setTitle("❌ Afmeldingsformulier niet verwerkt")
+          .setDescription(
+            `${validation.error}\n\nVul de template opnieuw in met de juiste gegevens.`,
+          )
+          .setTimestamp(),
+      ],
+      allowedMentions: { users: [fullMessage.author.id] },
+    });
+    absenceApprovalSourceIds.add(fullMessage.id);
+    await fullMessage.delete().catch(() => null);
+    queueAbsenceLog(
+      fullMessage.guild,
+      "❌ Ongeldig afmeldingsformulier",
+      0xed4245,
+      [
+        `**Ingediend door:** <@${fullMessage.author.id}>`,
+        `**Fout:** ${validation.error}`,
+      ],
+    );
+    return true;
+  }
+
+  const record = validation.record;
+  const overlap = findOverlappingAbsenceRequest(record);
+
+  if (overlap) {
+    const existingMessageUrl =
+      `https://discord.com/channels/${fullMessage.guildId}/` +
+      `${fullMessage.channelId}/${overlap.messageId}`;
+
+    await fullMessage.channel.send({
+      content: `<@${fullMessage.author.id}>`,
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0xed4245)
+          .setTitle("❌ Dubbele afwezigheidsaanvraag geblokkeerd")
+          .setDescription(
+            [
+              `<@${record.userId}> heeft al een wachtende of goedgekeurde aanvraag die met deze datums overlapt.`,
+              `[Bekijk de bestaande aanvraag](${existingMessageUrl})`,
+            ].join("\n"),
+          )
+          .setTimestamp(),
+      ],
+      allowedMentions: { users: [fullMessage.author.id] },
+    });
+    absenceApprovalSourceIds.add(fullMessage.id);
+    await fullMessage.delete().catch(() => null);
+    queueAbsenceLog(
+      fullMessage.guild,
+      "⚠️ Dubbele afwezigheidsaanvraag geblokkeerd",
+      0xfee75c,
+      [
+        `**Persoon:** <@${record.userId}>`,
+        `**Ingediend door:** <@${fullMessage.author.id}>`,
+        `**Bestaande aanvraag:** [Open bericht](${existingMessageUrl})`,
+      ],
+    );
+    return true;
+  }
 
   const pendingMessage = await fullMessage.channel.send({
     embeds: [buildPendingAbsenceEmbed(record, fullMessage)],
@@ -1118,6 +1369,23 @@ async function processAbsenceTemplateMessage(message) {
   });
 
   absenceApprovalSourceIds.add(fullMessage.id);
+  pendingAbsencesByMessageId.set(pendingMessage.id, {
+    ...record,
+    requesterId: fullMessage.author.id,
+  });
+
+  queueAbsenceLog(
+    fullMessage.guild,
+    "⏳ Nieuwe afwezigheidsaanvraag",
+    0xfee75c,
+    [
+      `**Persoon:** <@${record.userId}>`,
+      `**Ingediend door:** <@${fullMessage.author.id}>`,
+      `**Periode:** <t:${Math.floor(record.start.getTime() / 1_000)}:D> t/m <t:${Math.floor(record.end.getTime() / 1_000)}:D>`,
+      `**Reden:** ${cleanEmbedValue(record.reason, 500)}`,
+      `**Aanvraag:** [Open bericht](${pendingMessage.url})`,
+    ],
+  );
 
   try {
     await fullMessage.delete();
@@ -1144,6 +1412,7 @@ async function migrateUnprocessedAbsenceTemplates(guild) {
   );
 
   approvedAbsencesByMessageId.clear();
+  pendingAbsencesByMessageId.clear();
   const orderedMessages = [...messages].sort(
     (messageA, messageB) =>
       messageA.createdTimestamp - messageB.createdTimestamp,
@@ -1156,9 +1425,14 @@ async function migrateUnprocessedAbsenceTemplates(guild) {
     );
 
     if (removedUserId) {
-      for (const [messageId, record] of approvedAbsencesByMessageId) {
-        if (record.userId === removedUserId) {
-          approvedAbsencesByMessageId.delete(messageId);
+      for (const requests of [
+        pendingAbsencesByMessageId,
+        approvedAbsencesByMessageId,
+      ]) {
+        for (const [messageId, record] of requests) {
+          if (record.userId === removedUserId) {
+            requests.delete(messageId);
+          }
         }
       }
       continue;
@@ -1169,14 +1443,21 @@ async function migrateUnprocessedAbsenceTemplates(guild) {
     if (approvalData) {
       absenceApprovalSourceIds.add(approvalData.sourceMessageId);
 
-      if (approvalData.status === "approved") {
-        const record = parseAbsenceForm(message);
+      const record = parseAbsenceForm(message);
 
-        if (record) {
+      if (record) {
+        const storedRecord = {
+          ...record,
+          requesterId: approvalData.requesterId,
+        };
+
+        if (approvalData.status === "approved") {
           approvedAbsencesByMessageId.set(message.id, {
-            userId: record.userId,
-            end: record.end,
+            ...storedRecord,
+            reviewerId: approvalData.reviewerId,
           });
+        } else if (approvalData.status === "pending") {
+          pendingAbsencesByMessageId.set(message.id, storedRecord);
         }
       }
     }
@@ -1257,6 +1538,88 @@ async function assignApprovedAbsenceRole(guild, userId, auditReason) {
   return true;
 }
 
+function setAutomaticAbsenceStatus(description, automaticStatus) {
+  const statusLine =
+    `> **Automatische status:** ${automaticStatus.emoji} ${automaticStatus.label}`;
+  const currentDescription = String(description || "");
+
+  if (/^> \*\*Automatische status:\*\*.*$/m.test(currentDescription)) {
+    return currentDescription.replace(
+      /^> \*\*Automatische status:\*\*.*$/m,
+      statusLine,
+    );
+  }
+
+  return `${currentDescription}\n> ${statusLine.slice(2)}`;
+}
+
+async function updateApprovedAbsenceMessageStatus(
+  guild,
+  messageId,
+  record,
+  now = new Date(),
+) {
+  const automaticStatus = getAutomaticAbsenceStatus(record, now);
+
+  if (record.lastAutomaticStatus === automaticStatus.key) return false;
+
+  const channel = await client.channels.fetch(CONFIG.absenceChannelId);
+
+  if (!channel?.isTextBased() || !channel.messages) {
+    throw new Error("Het afwezigheidskanaal is geen tekstkanaal.");
+  }
+
+  const message = await channel.messages.fetch(messageId).catch(() => null);
+
+  if (!message) {
+    approvedAbsencesByMessageId.delete(messageId);
+    return false;
+  }
+  const approvalData = getAbsenceApprovalData(message);
+
+  if (!approvalData || approvalData.status !== "approved") {
+    approvedAbsencesByMessageId.delete(messageId);
+    return false;
+  }
+
+  const sourceEmbed = approvalData.embed;
+  const updatedDescription = setAutomaticAbsenceStatus(
+    sourceEmbed.description,
+    automaticStatus,
+  );
+  const desiredTitle =
+    `${automaticStatus.emoji} Afmeldingsformulier — ${automaticStatus.label}`;
+  const changed =
+    sourceEmbed.title !== desiredTitle ||
+    sourceEmbed.description !== updatedDescription ||
+    sourceEmbed.color !== automaticStatus.color;
+
+  record.lastAutomaticStatus = automaticStatus.key;
+
+  if (!changed) return false;
+
+  const updatedEmbed = new EmbedBuilder(sourceEmbed.toJSON())
+    .setColor(automaticStatus.color)
+    .setTitle(desiredTitle)
+    .setDescription(updatedDescription);
+
+  await message.edit({
+    embeds: [updatedEmbed],
+    components: [buildApprovedAbsenceButtons()],
+    allowedMentions: { parse: [] },
+  });
+
+  if (automaticStatus.key === "ended") {
+    queueAbsenceLog(guild, "⚪ Afwezigheid afgelopen", 0x95a5a6, [
+      `**Persoon:** <@${record.userId}>`,
+      `**Einddatum:** <t:${Math.floor(record.end.getTime() / 1_000)}:f>`,
+      `**Aanvraag:** [Open bericht](${message.url})`,
+    ]);
+  }
+
+  return true;
+}
+
 async function reconcileApprovedAbsenceRoles(guild, now = new Date()) {
   const { role } = await getApprovedAbsenceRole(guild);
   const activeUserIds = new Set();
@@ -1265,10 +1628,23 @@ async function reconcileApprovedAbsenceRoles(guild, now = new Date()) {
   let failedCount = 0;
 
   for (const [messageId, record] of approvedAbsencesByMessageId) {
+    try {
+      await updateApprovedAbsenceMessageStatus(
+        guild,
+        messageId,
+        record,
+        now,
+      );
+    } catch (error) {
+      failedCount += 1;
+      console.error(
+        `Automatische afwezigheidsstatus kon niet worden bijgewerkt voor bericht ${messageId}:`,
+        error,
+      );
+    }
+
     if (record.end >= now) {
       activeUserIds.add(record.userId);
-    } else {
-      approvedAbsencesByMessageId.delete(messageId);
     }
   }
 
@@ -3026,12 +3402,9 @@ async function handleAbsenceApprovalInteraction(interaction) {
     return;
   }
 
-  if (
-    !interaction.inGuild() ||
-    !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
-  ) {
+  if (!interaction.inGuild()) {
     await interaction.reply({
-      content: "❌ Alleen serverbeheerders mogen afmeldingen beoordelen.",
+      content: "❌ Deze knop werkt alleen in de Discord-server.",
       flags: MessageFlags.Ephemeral,
     });
     return;
@@ -3049,6 +3422,10 @@ async function handleAbsenceApprovalInteraction(interaction) {
   }
 
   const approvalData = getAbsenceApprovalData(interaction.message);
+  const action = interaction.customId.split(":")[1];
+  const isAdministrator = interaction.memberPermissions?.has(
+    PermissionFlagsBits.Administrator,
+  );
 
   if (!approvalData) {
     await interaction.reply({
@@ -3058,9 +3435,157 @@ async function handleAbsenceApprovalInteraction(interaction) {
     return;
   }
 
+  if (action === "extend" || action === "note") {
+    if (!isAdministrator) {
+      await interaction.reply({
+        content: "❌ Alleen serverbeheerders mogen deze actie gebruiken.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (
+      action === "extend" &&
+      approvalData.status !== "approved"
+    ) {
+      await interaction.reply({
+        content: "❌ Alleen een goedgekeurde afwezigheid kan worden verlengd.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (
+      action === "note" &&
+      !["pending", "approved"].includes(approvalData.status)
+    ) {
+      await interaction.reply({
+        content: "❌ Aan dit afgehandelde formulier kan geen opmerking worden toegevoegd.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const record = parseAbsenceForm(interaction.message);
+
+    if (!record) {
+      await interaction.reply({
+        content: "❌ De formuliergegevens konden niet worden gelezen.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    await interaction.showModal(
+      action === "extend"
+        ? buildAbsenceExtensionModal(interaction.message.id, record.end)
+        : buildAbsenceNoteModal(interaction.message.id),
+    );
+    return;
+  }
+
+  if (action === "withdraw") {
+    if (
+      interaction.user.id !== approvalData.requesterId &&
+      !isAdministrator
+    ) {
+      await interaction.reply({
+        content: "❌ Alleen de indiener of een serverbeheerder kan deze aanvraag intrekken.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (approvalData.status !== "pending") {
+      await interaction.reply({
+        content: "ℹ️ Alleen een wachtende aanvraag kan worden ingetrokken.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (absenceApprovalProcessingIds.has(interaction.message.id)) {
+      await interaction.reply({
+        content: "⏳ Dit formulier wordt al verwerkt.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    absenceApprovalProcessingIds.add(interaction.message.id);
+
+    try {
+      const sourceEmbed = approvalData.embed;
+      const updatedDescription = String(sourceEmbed.description || "").replace(
+        /> \*\*Status:\*\*.*$/m,
+        `> **Status:** ↩️ Ingetrokken door <@${interaction.user.id}>`,
+      );
+      const updatedEmbed = new EmbedBuilder(sourceEmbed.toJSON())
+        .setColor(0x95a5a6)
+        .setTitle("↩️ Afmeldingsformulier — ingetrokken")
+        .setDescription(updatedDescription)
+        .setFooter({
+          text: getAbsenceApprovalFooter(
+            "withdrawn",
+            approvalData.userId,
+            approvalData.requesterId,
+            approvalData.sourceMessageId,
+            interaction.user.id,
+          ),
+        })
+        .setTimestamp();
+
+      await interaction.update({
+        embeds: [updatedEmbed],
+        components: [],
+        allowedMentions: { parse: [] },
+      });
+      pendingAbsencesByMessageId.delete(interaction.message.id);
+      queueAbsenceLog(interaction.guild, "↩️ Aanvraag ingetrokken", 0x95a5a6, [
+        `**Persoon:** <@${approvalData.userId}>`,
+        `**Ingetrokken door:** <@${interaction.user.id}>`,
+        `**Aanvraag:** [Open bericht](${interaction.message.url})`,
+      ]);
+      void refreshDashboard("inactivity");
+    } catch (error) {
+      const content = `❌ Aanvraag kon niet worden ingetrokken: ${error.message}`;
+
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp({
+          content,
+          flags: MessageFlags.Ephemeral,
+        });
+      } else {
+        await interaction.reply({
+          content,
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+    } finally {
+      absenceApprovalProcessingIds.delete(interaction.message.id);
+    }
+    return;
+  }
+
+  if (!isAdministrator) {
+    await interaction.reply({
+      content: "❌ Alleen serverbeheerders mogen afmeldingen beoordelen.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
   if (approvalData.status !== "pending") {
     await interaction.reply({
       content: "ℹ️ Dit afmeldingsformulier is al beoordeeld.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (!["approve", "reject"].includes(action)) {
+    await interaction.reply({
+      content: "❌ Onbekende beoordelingsactie.",
       flags: MessageFlags.Ephemeral,
     });
     return;
@@ -3088,16 +3613,6 @@ async function handleAbsenceApprovalInteraction(interaction) {
       return;
     }
 
-    const action = interaction.customId.split(":")[1];
-
-    if (!["approve", "reject"].includes(action)) {
-      await interaction.reply({
-        content: "❌ Onbekende beoordelingsactie.",
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-
     const approved = action === "approve";
     const status = approved ? "approved" : "rejected";
 
@@ -3113,15 +3628,26 @@ async function handleAbsenceApprovalInteraction(interaction) {
       ? `✅ Goedgekeurd door <@${interaction.user.id}>`
       : `❌ Afgekeurd door <@${interaction.user.id}>`;
     const sourceEmbed = approvalData.embed;
-    const updatedDescription = String(sourceEmbed.description || "").replace(
+    let updatedDescription = String(sourceEmbed.description || "").replace(
       /> \*\*Status:\*\*.*$/m,
       `> **Status:** ${statusText}`,
     );
+    const automaticStatus = approved
+      ? getAutomaticAbsenceStatus(record)
+      : null;
+
+    if (automaticStatus) {
+      updatedDescription = setAutomaticAbsenceStatus(
+        updatedDescription,
+        automaticStatus,
+      );
+    }
+
     const updatedEmbed = new EmbedBuilder(sourceEmbed.toJSON())
-      .setColor(approved ? 0x57f287 : 0xed4245)
+      .setColor(automaticStatus?.color ?? 0xed4245)
       .setTitle(
         approved
-          ? "✅ Afmeldingsformulier — goedgekeurd"
+          ? `${automaticStatus.emoji} Afmeldingsformulier — ${automaticStatus.label}`
           : "❌ Afmeldingsformulier — afgekeurd",
       )
       .setDescription(updatedDescription)
@@ -3138,18 +3664,34 @@ async function handleAbsenceApprovalInteraction(interaction) {
 
     await interaction.update({
       embeds: [updatedEmbed],
-      components: [],
+      components: approved ? [buildApprovedAbsenceButtons()] : [],
       allowedMentions: { parse: [] },
     });
 
+    pendingAbsencesByMessageId.delete(interaction.message.id);
+
     if (approved) {
       approvedAbsencesByMessageId.set(interaction.message.id, {
-        userId: record.userId,
-        end: record.end,
+        ...record,
+        requesterId: approvalData.requesterId,
+        reviewerId: interaction.user.id,
+        lastAutomaticStatus: automaticStatus.key,
       });
     } else {
       approvedAbsencesByMessageId.delete(interaction.message.id);
     }
+
+    queueAbsenceLog(
+      interaction.guild,
+      approved ? "✅ Afwezigheid goedgekeurd" : "❌ Afwezigheid afgekeurd",
+      approved ? 0x57f287 : 0xed4245,
+      [
+        `**Persoon:** <@${record.userId}>`,
+        `**Beoordeeld door:** <@${interaction.user.id}>`,
+        `**Periode:** <t:${Math.floor(record.start.getTime() / 1_000)}:D> t/m <t:${Math.floor(record.end.getTime() / 1_000)}:D>`,
+        `**Aanvraag:** [Open bericht](${interaction.message.url})`,
+      ],
+    );
 
     void refreshDashboard("inactivity");
     void reconcileApprovedAbsenceRoles(interaction.guild);
@@ -3169,6 +3711,191 @@ async function handleAbsenceApprovalInteraction(interaction) {
     }
   } finally {
     absenceApprovalProcessingIds.delete(interaction.message.id);
+  }
+}
+
+async function handleAbsenceModalInteraction(interaction) {
+  if (
+    !interaction.isModalSubmit() ||
+    !interaction.customId.startsWith("absence-approval:")
+  ) {
+    return;
+  }
+
+  if (
+    !interaction.inGuild() ||
+    interaction.channelId !== CONFIG.absenceChannelId ||
+    !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+  ) {
+    await interaction.reply({
+      content: "❌ Alleen serverbeheerders mogen dit formulier gebruiken.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const [, action, messageId] = interaction.customId.split(":");
+
+  if (!messageId || !["extend-modal", "note-modal"].includes(action)) {
+    await interaction.editReply("❌ Onbekend afwezigheidsformulier.");
+    return;
+  }
+
+  if (absenceApprovalProcessingIds.has(messageId)) {
+    await interaction.editReply("⏳ Dit formulier wordt al verwerkt.");
+    return;
+  }
+
+  absenceApprovalProcessingIds.add(messageId);
+
+  try {
+    const channel = await client.channels.fetch(CONFIG.absenceChannelId);
+
+    if (!channel?.isTextBased() || !channel.messages) {
+      throw new Error("Het afwezigheidskanaal is geen tekstkanaal.");
+    }
+
+    const message = await channel.messages.fetch(messageId);
+    const approvalData = getAbsenceApprovalData(message);
+
+    if (!approvalData) {
+      throw new Error("De goedkeuringsgegevens ontbreken.");
+    }
+
+    const record = parseAbsenceForm(message);
+
+    if (!record) {
+      throw new Error("De formuliergegevens konden niet worden gelezen.");
+    }
+
+    if (action === "extend-modal") {
+      if (approvalData.status !== "approved") {
+        throw new Error("Alleen een goedgekeurde afwezigheid kan worden verlengd.");
+      }
+
+      const newEndDateText = interaction.fields
+        .getTextInputValue("new_end_date")
+        .trim();
+      const newEnd = parseDutchDateTime(newEndDateText, "", true);
+
+      if (!newEnd) {
+        throw new Error("Gebruik voor de nieuwe einddatum `DD-MM-JJJJ`.");
+      }
+
+      if (newEnd <= record.end) {
+        throw new Error("De nieuwe einddatum moet ná de huidige einddatum liggen.");
+      }
+
+      const extendedRecord = { ...record, end: newEnd };
+      const overlap = findOverlappingAbsenceRequest(
+        extendedRecord,
+        message.id,
+      );
+
+      if (overlap) {
+        throw new Error(
+          "De verlenging overlapt met een andere wachtende of goedgekeurde aanvraag.",
+        );
+      }
+
+      await assignApprovedAbsenceRole(
+        interaction.guild,
+        record.userId,
+        `Afwezigheid verlengd door ${interaction.user.tag} (${interaction.user.id}).`,
+      );
+
+      const automaticStatus = getAutomaticAbsenceStatus(extendedRecord);
+      const sourceEmbed = approvalData.embed;
+      let updatedDescription = String(sourceEmbed.description || "").replace(
+        /^> \*\*Eind datum:\*\*.*$/m,
+        `> **Eind datum:** ${formatLocalDate(newEnd)}`,
+      );
+      updatedDescription = setAutomaticAbsenceStatus(
+        updatedDescription,
+        automaticStatus,
+      );
+      const updatedEmbed = new EmbedBuilder(sourceEmbed.toJSON())
+        .setColor(automaticStatus.color)
+        .setTitle(
+          `${automaticStatus.emoji} Afmeldingsformulier — ${automaticStatus.label}`,
+        )
+        .setDescription(updatedDescription)
+        .setTimestamp();
+
+      await message.edit({
+        embeds: [updatedEmbed],
+        components: [buildApprovedAbsenceButtons()],
+        allowedMentions: { parse: [] },
+      });
+      approvedAbsencesByMessageId.set(message.id, {
+        ...extendedRecord,
+        requesterId: approvalData.requesterId,
+        reviewerId: approvalData.reviewerId,
+        lastAutomaticStatus: automaticStatus.key,
+      });
+      queueAbsenceLog(interaction.guild, "📅 Afwezigheid verlengd", 0x5865f2, [
+        `**Persoon:** <@${record.userId}>`,
+        `**Verlengd door:** <@${interaction.user.id}>`,
+        `**Oude einddatum:** <t:${Math.floor(record.end.getTime() / 1_000)}:D>`,
+        `**Nieuwe einddatum:** <t:${Math.floor(newEnd.getTime() / 1_000)}:D>`,
+        `**Aanvraag:** [Open bericht](${message.url})`,
+      ]);
+      await interaction.editReply(
+        `✅ De afwezigheid is verlengd tot <t:${Math.floor(newEnd.getTime() / 1_000)}:D>.`,
+      );
+      void reconcileApprovedAbsenceRoles(interaction.guild);
+      return;
+    }
+
+    if (!["pending", "approved"].includes(approvalData.status)) {
+      throw new Error("Aan dit afgehandelde formulier kan geen opmerking worden toegevoegd.");
+    }
+
+    const note = cleanEmbedValue(
+      interaction.fields.getTextInputValue("admin_note"),
+      500,
+    );
+    const sourceEmbed = approvalData.embed;
+    const embedData = sourceEmbed.toJSON();
+    const fields = [...(embedData.fields || [])];
+    const noteField = {
+      name: "📝 Opmerking beheerder",
+      value: `${note}\n— <@${interaction.user.id}>`,
+      inline: false,
+    };
+    const existingNoteIndex = fields.findIndex(
+      (field) => field.name === noteField.name,
+    );
+
+    if (existingNoteIndex >= 0) {
+      fields[existingNoteIndex] = noteField;
+    } else {
+      fields.push(noteField);
+    }
+
+    const updatedEmbed = new EmbedBuilder({ ...embedData, fields }).setTimestamp();
+
+    await message.edit({
+      embeds: [updatedEmbed],
+      components:
+        approvalData.status === "approved"
+          ? [buildApprovedAbsenceButtons()]
+          : [buildAbsenceApprovalButtons()],
+      allowedMentions: { parse: [] },
+    });
+    queueAbsenceLog(interaction.guild, "📝 Beheerdersopmerking toegevoegd", 0x5865f2, [
+      `**Persoon:** <@${record.userId}>`,
+      `**Beheerder:** <@${interaction.user.id}>`,
+      `**Opmerking:** ${note}`,
+      `**Aanvraag:** [Open bericht](${message.url})`,
+    ]);
+    await interaction.editReply("✅ De beheerdersopmerking is toegevoegd.");
+  } catch (error) {
+    await interaction.editReply(`❌ ${error.message}`);
+  } finally {
+    absenceApprovalProcessingIds.delete(messageId);
   }
 }
 
@@ -4109,11 +4836,71 @@ async function handleAbsenceCommand(interaction) {
       allowedMentions: { parse: [] },
     });
 
-    for (const [messageId, record] of approvedAbsencesByMessageId) {
-      if (record.userId === targetMember.id) {
-        approvedAbsencesByMessageId.delete(messageId);
+    const affectedRequestIds = [];
+
+    for (const requests of [
+      pendingAbsencesByMessageId,
+      approvedAbsencesByMessageId,
+    ]) {
+      for (const [messageId, record] of requests) {
+        if (record.userId === targetMember.id) {
+          affectedRequestIds.push(messageId);
+          requests.delete(messageId);
+        }
       }
     }
+
+    for (const messageId of new Set(affectedRequestIds)) {
+      try {
+        const requestMessage = await absenceChannel.messages.fetch(messageId);
+        const approvalData = getAbsenceApprovalData(requestMessage);
+
+        if (!approvalData) continue;
+
+        const sourceEmbed = approvalData.embed;
+        const updatedDescription = String(
+          sourceEmbed.description || "",
+        ).replace(
+          /> \*\*Status:\*\*.*$/m,
+          `> **Status:** 🗑️ Handmatig verwijderd door <@${interaction.user.id}>`,
+        );
+        const updatedEmbed = new EmbedBuilder(sourceEmbed.toJSON())
+          .setColor(0x95a5a6)
+          .setTitle("🗑️ Afmeldingsformulier — handmatig verwijderd")
+          .setDescription(updatedDescription)
+          .setFooter({
+            text: getAbsenceApprovalFooter(
+              "withdrawn",
+              approvalData.userId,
+              approvalData.requesterId,
+              approvalData.sourceMessageId,
+              interaction.user.id,
+            ),
+          })
+          .setTimestamp();
+
+        await requestMessage.edit({
+          embeds: [updatedEmbed],
+          components: [],
+          allowedMentions: { parse: [] },
+        });
+      } catch (error) {
+        console.error(
+          `Afwezigheidsaanvraag ${messageId} kon niet als handmatig verwijderd worden gemarkeerd:`,
+          error,
+        );
+      }
+    }
+
+    queueAbsenceLog(
+      interaction.guild,
+      "🗑️ Afwezigheid handmatig verwijderd",
+      0xed4245,
+      [
+        `**Persoon:** <@${targetMember.id}>`,
+        `**Verwijderd door:** <@${interaction.user.id}>`,
+      ],
+    );
 
     void reconcileApprovedAbsenceRoles(interaction.guild).catch((error) => {
       console.error(
@@ -4177,6 +4964,14 @@ client.on(Events.InteractionCreate, (interaction) => {
     interaction.customId.startsWith("absence-approval:")
   ) {
     void handleAbsenceApprovalInteraction(interaction);
+    return;
+  }
+
+  if (
+    interaction.isModalSubmit() &&
+    interaction.customId.startsWith("absence-approval:")
+  ) {
+    void handleAbsenceModalInteraction(interaction);
   }
 });
 
@@ -4242,6 +5037,19 @@ client.on(Events.MessageDelete, (message) => {
     message.channelId === CONFIG.absenceChannelId
   ) {
     void refreshDashboard();
+  }
+
+  if (message.channelId === CONFIG.absenceChannelId) {
+    pendingAbsencesByMessageId.delete(message.id);
+    const removedApprovedRequest = approvedAbsencesByMessageId.delete(
+      message.id,
+    );
+
+    if (removedApprovedRequest) {
+      const guild = client.guilds.cache.get(dashboardGuildId);
+
+      if (guild) void reconcileApprovedAbsenceRoles(guild);
+    }
   }
 });
 
