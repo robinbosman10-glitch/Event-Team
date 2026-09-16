@@ -86,6 +86,7 @@ const CONFIG = Object.freeze({
   removedAbsenceMarker: "AFR-AFWEZIG-VERWIJDERD",
   absenceApprovalMarker: "AFR-AFWEZIGHEID-GOEDKEURING",
   absenceApprovalStartTimestamp: Date.UTC(2026, 8, 16),
+  approvedAbsenceRoleId: "1549874222002741318",
   blacklistMarker: "AFR-BLACKLIST",
 });
 
@@ -311,6 +312,7 @@ const blacklistUserIds = new Set();
 const promotionSessions = new Map();
 const absenceApprovalSourceIds = new Set();
 const absenceApprovalProcessingIds = new Set();
+const approvedAbsencesByMessageId = new Map();
 let refreshInProgress = false;
 let dashboardGuildId = null;
 let archiveTestSentThisSession = false;
@@ -1136,17 +1138,47 @@ async function migrateUnprocessedAbsenceTemplates(guild) {
     throw new Error("Het afwezigheidskanaal is geen tekstkanaal.");
   }
 
-  const sixtyDaysAgo = Date.now() - 60 * 24 * 60 * 60 * 1000;
   const messages = await fetchMessagesSince(
     channel,
-    Math.max(CONFIG.absenceApprovalStartTimestamp, sixtyDaysAgo),
+    CONFIG.absenceApprovalStartTimestamp,
   );
 
-  for (const message of messages) {
+  approvedAbsencesByMessageId.clear();
+  const orderedMessages = [...messages].sort(
+    (messageA, messageB) =>
+      messageA.createdTimestamp - messageB.createdTimestamp,
+  );
+
+  for (const message of orderedMessages) {
+    const removedUserId = getMarkedUserId(
+      message,
+      CONFIG.removedAbsenceMarker,
+    );
+
+    if (removedUserId) {
+      for (const [messageId, record] of approvedAbsencesByMessageId) {
+        if (record.userId === removedUserId) {
+          approvedAbsencesByMessageId.delete(messageId);
+        }
+      }
+      continue;
+    }
+
     const approvalData = getAbsenceApprovalData(message);
 
     if (approvalData) {
       absenceApprovalSourceIds.add(approvalData.sourceMessageId);
+
+      if (approvalData.status === "approved") {
+        const record = parseAbsenceForm(message);
+
+        if (record) {
+          approvedAbsencesByMessageId.set(message.id, {
+            userId: record.userId,
+            end: record.end,
+          });
+        }
+      }
     }
   }
 
@@ -1172,6 +1204,121 @@ async function migrateUnprocessedAbsenceTemplates(guild) {
     `Afwezigheidstemplates gecontroleerd in ${guild.name}: ${convertedCount} openstaand(e) formulier(en) omgezet.`,
   );
   return convertedCount;
+}
+
+async function getApprovedAbsenceRole(guild) {
+  const botMember =
+    guild.members.me ??
+    (await guild.members.fetchMe());
+  const role =
+    guild.roles.cache.get(CONFIG.approvedAbsenceRoleId) ??
+    (await guild.roles.fetch(CONFIG.approvedAbsenceRoleId).catch(() => null));
+
+  if (!role) {
+    throw new Error(
+      `De afwezigheidsrol ${CONFIG.approvedAbsenceRoleId} bestaat niet.`,
+    );
+  }
+
+  if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) {
+    throw new Error("De bot mist de machtiging `Rollen beheren`.");
+  }
+
+  if (
+    role.id === guild.id ||
+    role.managed ||
+    role.position >= botMember.roles.highest.position
+  ) {
+    throw new Error(
+      "De afwezigheidsrol moet onder de hoogste botrol staan.",
+    );
+  }
+
+  return { botMember, role };
+}
+
+async function assignApprovedAbsenceRole(guild, userId, auditReason) {
+  const { role } = await getApprovedAbsenceRole(guild);
+  const member =
+    guild.members.cache.get(userId) ??
+    (await guild.members.fetch(userId).catch(() => null));
+
+  if (!member) {
+    throw new Error("De persoon zit niet meer in deze Discord-server.");
+  }
+
+  if (!member.manageable) {
+    throw new Error("De hoogste botrol staat niet boven deze persoon.");
+  }
+
+  if (member.roles.cache.has(role.id)) return false;
+
+  await member.roles.add(role, auditReason.slice(0, 512));
+  return true;
+}
+
+async function reconcileApprovedAbsenceRoles(guild, now = new Date()) {
+  const { role } = await getApprovedAbsenceRole(guild);
+  const activeUserIds = new Set();
+  let addedCount = 0;
+  let removedCount = 0;
+  let failedCount = 0;
+
+  for (const [messageId, record] of approvedAbsencesByMessageId) {
+    if (record.end >= now) {
+      activeUserIds.add(record.userId);
+    } else {
+      approvedAbsencesByMessageId.delete(messageId);
+    }
+  }
+
+  for (const userId of activeUserIds) {
+    try {
+      if (
+        await assignApprovedAbsenceRole(
+          guild,
+          userId,
+          "Goedgekeurde afwezigheid automatisch hersteld.",
+        )
+      ) {
+        addedCount += 1;
+      }
+    } catch (error) {
+      failedCount += 1;
+      console.error(
+        `Afwezigheidsrol kon niet worden toegevoegd aan ${userId}:`,
+        error,
+      );
+    }
+  }
+
+  for (const member of role.members.values()) {
+    if (activeUserIds.has(member.id)) continue;
+
+    try {
+      if (!member.manageable) {
+        throw new Error("De hoogste botrol staat niet boven deze persoon.");
+      }
+
+      await member.roles.remove(
+        role,
+        "Goedgekeurde afwezigheid is afgelopen.",
+      );
+      removedCount += 1;
+    } catch (error) {
+      failedCount += 1;
+      console.error(
+        `Verlopen afwezigheidsrol kon niet worden verwijderd van ${member.id}:`,
+        error,
+      );
+    }
+  }
+
+  console.log(
+    `Afwezigheidsrollen gecontroleerd: ${activeUserIds.size} actief; ${addedCount} toegevoegd; ${removedCount} verwijderd; ${failedCount} mislukt.`,
+  );
+
+  return { activeUserIds, addedCount, removedCount, failedCount };
 }
 
 function collectAbsenceRecords(messages, allowedMemberIds, monthStart) {
@@ -2036,9 +2183,24 @@ function scheduleDashboardUpdates() {
   const delayUntilNextUpdate =
     CONFIG.updateIntervalMs - (Date.now() % CONFIG.updateIntervalMs);
 
-  setTimeout(() => {
+  const runScheduledUpdates = () => {
     void refreshDashboard();
-    setInterval(() => void refreshDashboard(), CONFIG.updateIntervalMs);
+
+    const guild = client.guilds.cache.get(dashboardGuildId);
+
+    if (guild) {
+      void reconcileApprovedAbsenceRoles(guild).catch((error) => {
+        console.error(
+          "De afwezigheidsrollen konden niet worden bijgewerkt:",
+          error,
+        );
+      });
+    }
+  };
+
+  setTimeout(() => {
+    runScheduledUpdates();
+    setInterval(runScheduledUpdates, CONFIG.updateIntervalMs);
   }, delayUntilNextUpdate);
 }
 
@@ -2938,6 +3100,15 @@ async function handleAbsenceApprovalInteraction(interaction) {
 
     const approved = action === "approve";
     const status = approved ? "approved" : "rejected";
+
+    if (approved && record.end >= new Date()) {
+      await assignApprovedAbsenceRole(
+        interaction.guild,
+        record.userId,
+        `Afwezigheid goedgekeurd door ${interaction.user.tag} (${interaction.user.id}).`,
+      );
+    }
+
     const statusText = approved
       ? `✅ Goedgekeurd door <@${interaction.user.id}>`
       : `❌ Afgekeurd door <@${interaction.user.id}>`;
@@ -2970,7 +3141,32 @@ async function handleAbsenceApprovalInteraction(interaction) {
       components: [],
       allowedMentions: { parse: [] },
     });
+
+    if (approved) {
+      approvedAbsencesByMessageId.set(interaction.message.id, {
+        userId: record.userId,
+        end: record.end,
+      });
+    } else {
+      approvedAbsencesByMessageId.delete(interaction.message.id);
+    }
+
     void refreshDashboard("inactivity");
+    void reconcileApprovedAbsenceRoles(interaction.guild);
+  } catch (error) {
+    const content = `❌ Afmelding kon niet worden verwerkt: ${error.message}`;
+
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp({
+        content,
+        flags: MessageFlags.Ephemeral,
+      });
+    } else {
+      await interaction.reply({
+        content,
+        flags: MessageFlags.Ephemeral,
+      });
+    }
   } finally {
     absenceApprovalProcessingIds.delete(interaction.message.id);
   }
@@ -3912,6 +4108,19 @@ async function handleAbsenceCommand(interaction) {
       embeds: [removalEmbed],
       allowedMentions: { parse: [] },
     });
+
+    for (const [messageId, record] of approvedAbsencesByMessageId) {
+      if (record.userId === targetMember.id) {
+        approvedAbsencesByMessageId.delete(messageId);
+      }
+    }
+
+    void reconcileApprovedAbsenceRoles(interaction.guild).catch((error) => {
+      console.error(
+        `Afwezigheidsrol kon na handmatig verwijderen niet worden bijgewerkt voor ${targetMember.id}:`,
+        error,
+      );
+    });
     await refreshDashboard();
     await interaction.editReply(
       `<@${targetMember.id}> is uit de live afwezigheidslijst gehaald.`,
@@ -4187,6 +4396,19 @@ client.once(Events.ClientReady, async (readyClient) => {
   } catch (error) {
     console.error(
       "Openstaande afwezigheidstemplates konden niet worden omgezet:",
+      error,
+    );
+  }
+
+  try {
+    if (!dashboardGuild) {
+      throw new Error("De Discord-server kon niet worden gevonden.");
+    }
+
+    await reconcileApprovedAbsenceRoles(dashboardGuild);
+  } catch (error) {
+    console.error(
+      "De afwezigheidsrollen konden bij het opstarten niet worden bijgewerkt:",
       error,
     );
   }
