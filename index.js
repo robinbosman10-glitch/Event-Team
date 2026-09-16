@@ -44,8 +44,12 @@ const CONFIG = Object.freeze({
     "1542177617929703444",
     "1461807420740341835",
   ],
-  promotionSignatureUserId: "424086753327054849",
-  promotionSignatureRoleId: "1218521637368893471",
+  promotionEmbedTitle: "🎉 Promoties",
+  promotionHistoryStartTimestamp: Date.UTC(2026, 8, 6),
+  promotionSignatureLines: [
+    "<@424086753327054849> <@&1218521637368893471>",
+    "<@823103002456883230> <@&1518661886579707974>",
+  ],
   terminationPreservedRoleIds: ["1218323042204385310"],
   acceptedChannelId: "1449466069613019217",
   absenceCommandRoleId: "1218521637368893471",
@@ -2272,10 +2276,7 @@ function buildPromotionAnnouncementEmbed(successes, interaction) {
     ].join("\n"),
     inline: false,
   }));
-  const signature = [
-    `<@${CONFIG.promotionSignatureUserId}>`,
-    `<@&${CONFIG.promotionSignatureRoleId}>`,
-  ].join(" ");
+  const signature = CONFIG.promotionSignatureLines.join("\n");
 
   if (fields.length < 25) {
     fields.push({
@@ -2293,7 +2294,7 @@ function buildPromotionAnnouncementEmbed(successes, interaction) {
     interaction.user.username;
   const embed = new EmbedBuilder()
     .setColor(0xfee75c)
-    .setTitle("🎉 Promoties")
+    .setTitle(CONFIG.promotionEmbedTitle)
     .setDescription(
       successes.length === 1
         ? "Van harte gefeliciteerd met je promotie!"
@@ -2309,6 +2310,143 @@ function buildPromotionAnnouncementEmbed(successes, interaction) {
   const guildIconUrl = interaction.guild.iconURL();
   if (guildIconUrl) embed.setThumbnail(guildIconUrl);
   return embed;
+}
+
+function stripPromotionSignatureFromValue(value) {
+  const text = String(value || "");
+  const signatureMarker = "\n\n**Met vriendelijke Groet,**\n";
+  const markerIndex = text.lastIndexOf(signatureMarker);
+
+  return markerIndex >= 0 ? text.slice(0, markerIndex) : text;
+}
+
+function addPromotionSignatureToEmbedData(embedData) {
+  const signature = CONFIG.promotionSignatureLines.join("\n");
+  const fields = (embedData.fields || []).map((field) => ({
+    ...field,
+    value: stripPromotionSignatureFromValue(field.value),
+  }));
+  const signatureFieldIndex = fields.findIndex(
+    (field) => field.name?.trim().toLowerCase() === "met vriendelijke groet,",
+  );
+
+  if (signatureFieldIndex >= 0) {
+    fields[signatureFieldIndex] = {
+      name: "Met vriendelijke Groet,",
+      value: signature,
+      inline: false,
+    };
+  } else if (fields.length < 25) {
+    fields.push({
+      name: "Met vriendelijke Groet,",
+      value: signature,
+      inline: false,
+    });
+  } else {
+    fields.at(-1).value += `\n\n**Met vriendelijke Groet,**\n${signature}`;
+  }
+
+  return { ...embedData, fields };
+}
+
+function getUpdatedPromotionEmbeds(embeds) {
+  const embedData = embeds.map((embed) =>
+    typeof embed.toJSON === "function" ? embed.toJSON() : { ...embed },
+  );
+  const hasPromotionEmbed = embedData.some(
+    (embed) => embed.title === CONFIG.promotionEmbedTitle,
+  );
+
+  if (!hasPromotionEmbed) return null;
+
+  return embedData
+    .filter(
+      (embed) =>
+        embed.title === CONFIG.promotionEmbedTitle ||
+        !String(embed.description || "").includes("Met vriendelijke Groet,"),
+    )
+    .map((embed) =>
+      embed.title === CONFIG.promotionEmbedTitle
+        ? addPromotionSignatureToEmbedData(embed)
+        : embed,
+    );
+}
+
+async function updateOldPromotionMessages(guild) {
+  const botMember =
+    guild.members.me ??
+    (await guild.members.fetchMe());
+  const channels = await guild.channels.fetch();
+  let promotionMessageCount = 0;
+  let updatedMessageCount = 0;
+  let failedMessageCount = 0;
+
+  for (const channel of channels.values()) {
+    if (
+      !channel?.isTextBased() ||
+      !channel.messages ||
+      !channel.permissionsFor(botMember)?.has([
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.ReadMessageHistory,
+      ])
+    ) {
+      continue;
+    }
+
+    let messages;
+
+    try {
+      messages = await fetchMessagesSince(
+        channel,
+        CONFIG.promotionHistoryStartTimestamp,
+      );
+    } catch (error) {
+      console.error(
+        `Promotieberichten konden niet worden gelezen in kanaal ${channel.id}:`,
+        error,
+      );
+      continue;
+    }
+
+    for (const message of messages) {
+      if (message.author.id !== client.user.id) continue;
+
+      const updatedEmbeds = getUpdatedPromotionEmbeds(message.embeds);
+
+      if (!updatedEmbeds) continue;
+      promotionMessageCount += 1;
+
+      const currentEmbeds = message.embeds.map((embed) => embed.toJSON());
+
+      if (JSON.stringify(currentEmbeds) === JSON.stringify(updatedEmbeds)) {
+        continue;
+      }
+
+      try {
+        await message.edit({
+          embeds: updatedEmbeds,
+          allowedMentions: { parse: [] },
+        });
+        updatedMessageCount += 1;
+      } catch (error) {
+        failedMessageCount += 1;
+        console.error(
+          `Oud promotiebericht ${message.id} kon niet worden bijgewerkt:`,
+          error,
+        );
+      }
+    }
+  }
+
+  console.log(
+    `Promotieberichten gecontroleerd: ${promotionMessageCount}; bijgewerkt: ${updatedMessageCount}; mislukt: ${failedMessageCount}.`,
+  );
+
+  return {
+    promotionMessageCount,
+    updatedMessageCount,
+    failedMessageCount,
+  };
 }
 
 async function applyPromotion(record, interaction, botMember) {
@@ -3702,6 +3840,15 @@ client.once(Events.ClientReady, async (readyClient) => {
 
   await refreshDashboard();
   scheduleDashboardUpdates();
+
+  if (dashboardGuild) {
+    void updateOldPromotionMessages(dashboardGuild).catch((error) => {
+      console.error(
+        "De oude promotieberichten konden niet automatisch worden bijgewerkt:",
+        error,
+      );
+    });
+  }
 });
 
 function startBot() {
