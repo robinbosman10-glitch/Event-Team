@@ -4836,14 +4836,59 @@ async function handleAbsenceCommand(interaction) {
       allowedMentions: { parse: [] },
     });
 
+    const affectedRequestIds = [];
+
     for (const requests of [
       pendingAbsencesByMessageId,
       approvedAbsencesByMessageId,
     ]) {
       for (const [messageId, record] of requests) {
         if (record.userId === targetMember.id) {
+          affectedRequestIds.push(messageId);
           requests.delete(messageId);
         }
+      }
+    }
+
+    for (const messageId of new Set(affectedRequestIds)) {
+      try {
+        const requestMessage = await absenceChannel.messages.fetch(messageId);
+        const approvalData = getAbsenceApprovalData(requestMessage);
+
+        if (!approvalData) continue;
+
+        const sourceEmbed = approvalData.embed;
+        const updatedDescription = String(
+          sourceEmbed.description || "",
+        ).replace(
+          /> \*\*Status:\*\*.*$/m,
+          `> **Status:** 🗑️ Handmatig verwijderd door <@${interaction.user.id}>`,
+        );
+        const updatedEmbed = new EmbedBuilder(sourceEmbed.toJSON())
+          .setColor(0x95a5a6)
+          .setTitle("🗑️ Afmeldingsformulier — handmatig verwijderd")
+          .setDescription(updatedDescription)
+          .setFooter({
+            text: getAbsenceApprovalFooter(
+              "withdrawn",
+              approvalData.userId,
+              approvalData.requesterId,
+              approvalData.sourceMessageId,
+              interaction.user.id,
+            ),
+          })
+          .setTimestamp();
+
+        await requestMessage.edit({
+          embeds: [updatedEmbed],
+          components: [],
+          allowedMentions: { parse: [] },
+        });
+      } catch (error) {
+        console.error(
+          `Afwezigheidsaanvraag ${messageId} kon niet als handmatig verwijderd worden gemarkeerd:`,
+          error,
+        );
       }
     }
 
