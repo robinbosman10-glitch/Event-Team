@@ -9,6 +9,7 @@ const {
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  LabelBuilder,
   MessageFlags,
   ModalBuilder,
   Partials,
@@ -97,7 +98,7 @@ const CONFIG = Object.freeze({
 
 const absenceCommand = new SlashCommandBuilder()
   .setName("afwezig")
-  .setDescription("Dien voor één of meerdere personen een afwezigheid in.")
+  .setDescription("Dien voor jezelf een afwezigheidsaanvraag in.")
   .setDefaultMemberPermissions(null)
   .setDMPermission(false);
 
@@ -1232,8 +1233,7 @@ function createAbsenceFormSession(interaction) {
     ownerId: interaction.user.id,
     guildId: interaction.guildId,
     channelId: interaction.channelId,
-    userIds: [],
-    skippedUserIds: [],
+    userIds: [interaction.user.id],
     expiresAt: Date.now() + CONFIG.absenceFormSessionMs,
   };
 
@@ -1267,22 +1267,18 @@ function getAbsenceFormSession(interaction, sessionId) {
   return session;
 }
 
-function buildAbsenceUserSelectRow(sessionId) {
-  const userSelect = new UserSelectMenuBuilder()
-    .setCustomId(`absence-form:users:${sessionId}`)
-    .setPlaceholder("Kies 1 tot 25 afwezige personen")
+function buildAbsenceDetailsModal(sessionId) {
+  const staffSelect = new UserSelectMenuBuilder()
+    .setCustomId("staff_member")
+    .setPlaceholder("Kies het stafflid dat je wilt taggen")
     .setMinValues(1)
-    .setMaxValues(25);
-
-  return new ActionRowBuilder().addComponents(userSelect);
-}
-
-function buildAbsenceDetailsModal(sessionId, selectedCount) {
+    .setMaxValues(1)
+    .setRequired(true);
   const reasonInput = new TextInputBuilder()
     .setCustomId("reason")
     .setLabel("Reden")
     .setStyle(TextInputStyle.Paragraph)
-    .setPlaceholder("Waarom zijn deze personen afwezig?")
+    .setPlaceholder("Waarom ben je afwezig?")
     .setRequired(true)
     .setMaxLength(500);
   const startDateInput = new TextInputBuilder()
@@ -1302,13 +1298,19 @@ function buildAbsenceDetailsModal(sessionId, selectedCount) {
 
   return new ModalBuilder()
     .setCustomId(`absence-form:details:${sessionId}`)
-    .setTitle(`Afwezigheid voor ${selectedCount} perso${
-      selectedCount === 1 ? "on" : "nen"
-    }`)
-    .addComponents(
-      new ActionRowBuilder().addComponents(reasonInput),
-      new ActionRowBuilder().addComponents(startDateInput),
-      new ActionRowBuilder().addComponents(endDateInput),
+    .setTitle("Afwezigheidsformulier")
+    .addLabelComponents(
+      new LabelBuilder()
+        .setLabel("Stafflid taggen")
+        .setDescription("Dit stafflid ontvangt een melding van je aanvraag.")
+        .setUserSelectMenuComponent(staffSelect),
+      new LabelBuilder().setLabel("Reden").setTextInputComponent(reasonInput),
+      new LabelBuilder()
+        .setLabel("Begindatum")
+        .setTextInputComponent(startDateInput),
+      new LabelBuilder()
+        .setLabel("Einddatum")
+        .setTextInputComponent(endDateInput),
     );
 }
 
@@ -4787,65 +4789,7 @@ async function handleAbsenceCommand(interaction) {
     }
 
     const session = createAbsenceFormSession(interaction);
-    await interaction.reply({
-      content:
-        "Selecteer alle personen voor wie je dezelfde reden en periode wilt indienen. Daarna opent automatisch het formulier.",
-      components: [buildAbsenceUserSelectRow(session.id)],
-      flags: MessageFlags.Ephemeral,
-    });
-  } catch (error) {
-    const content = `❌ ${error.message}`;
-
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
-    } else {
-      await interaction.reply({ content, flags: MessageFlags.Ephemeral });
-    }
-  }
-}
-
-async function handleAbsenceFormUserSelection(interaction) {
-  if (
-    !interaction.isUserSelectMenu() ||
-    !interaction.customId.startsWith("absence-form:users:")
-  ) {
-    return;
-  }
-
-  try {
-    if (!interaction.inGuild()) {
-      throw new Error("Dit formulier werkt alleen in de Discord-server.");
-    }
-
-    const sessionId = interaction.customId.slice(
-      "absence-form:users:".length,
-    );
-    const session = getAbsenceFormSession(interaction, sessionId);
-    const validUserIds = [];
-    const skippedUserIds = [];
-
-    for (const userId of [...new Set(interaction.values)]) {
-      const user = interaction.users.get(userId);
-      const member =
-        interaction.guild.members.cache.get(userId) ??
-        (await interaction.guild.members.fetch(userId).catch(() => null));
-
-      if (!user || user.bot || !member) {
-        skippedUserIds.push(userId);
-      } else {
-        validUserIds.push(userId);
-      }
-    }
-
-    if (!validUserIds.length) {
-      throw new Error("Selecteer minimaal één persoon die in de server zit.");
-    }
-
-    session.userIds = validUserIds;
-    session.skippedUserIds = skippedUserIds;
-    await interaction.showModal(
-      buildAbsenceDetailsModal(session.id, validUserIds.length),
-    );
+    await interaction.showModal(buildAbsenceDetailsModal(session.id));
   } catch (error) {
     const content = `❌ ${error.message}`;
 
@@ -4877,9 +4821,14 @@ async function handleAbsenceFormModal(interaction) {
       "absence-form:details:".length,
     );
     session = getAbsenceFormSession(interaction, sessionId);
+    const selectedStaffUsers = interaction.fields.getSelectedUsers(
+      "staff_member",
+      true,
+    );
+    const staffUser = selectedStaffUsers?.first();
 
-    if (!session.userIds.length) {
-      throw new Error("Er zijn geen geldige personen geselecteerd.");
+    if (!staffUser || staffUser.bot) {
+      throw new Error("Kies een geldig stafflid om te taggen.");
     }
 
     if (session.processing) {
@@ -4888,6 +4837,24 @@ async function handleAbsenceFormModal(interaction) {
 
     session.processing = true;
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    const staffMember =
+      interaction.guild.members.cache.get(staffUser.id) ??
+      (await interaction.guild.members.fetch(staffUser.id).catch(() => null));
+
+    if (!staffMember) {
+      throw new Error("Het gekozen stafflid zit niet meer in de server.");
+    }
+
+    if (
+      !CONFIG.rankRoleIds.some((roleId) =>
+        staffMember.roles.cache.has(roleId),
+      )
+    ) {
+      throw new Error("De gekozen persoon heeft geen gekoppelde staffrol.");
+    }
+
+    session.tagId = staffUser.id;
 
     const reason = interaction.fields.getTextInputValue("reason").trim();
     const start = parseDutchDateTime(
@@ -4929,7 +4896,7 @@ async function handleAbsenceFormModal(interaction) {
     for (const userId of session.userIds) {
       const record = {
         userId,
-        tagId: session.ownerId,
+        tagId: session.tagId,
         reason: reason || "Geen reden opgegeven",
         start,
         end,
@@ -4945,6 +4912,7 @@ async function handleAbsenceFormModal(interaction) {
 
       try {
         const pendingMessage = await absenceChannel.send({
+          content: `<@${session.tagId}>`,
           embeds: [
             buildPendingAbsenceEmbed(record, {
               author: { id: session.ownerId },
@@ -4953,7 +4921,7 @@ async function handleAbsenceFormModal(interaction) {
             }),
           ],
           components: [buildAbsenceApprovalButtons()],
-          allowedMentions: { parse: [] },
+          allowedMentions: { users: [session.tagId] },
         });
 
         pendingAbsencesByMessageId.set(pendingMessage.id, {
@@ -4986,20 +4954,14 @@ async function handleAbsenceFormModal(interaction) {
 
     if (createdUserIds.length) {
       summaryLines.push(
-        `✅ ${createdUserIds.length} aanvraag${createdUserIds.length === 1 ? "" : "en"} aangemaakt voor ${createdUserIds.map((userId) => `<@${userId}>`).join(", ")}.`,
-        "Een serverbeheerder kan iedere persoon apart goedkeuren of afkeuren.",
+        `✅ Je afwezigheidsaanvraag is aangemaakt en <@${session.tagId}> is getagd.`,
+        "Een serverbeheerder kan de aanvraag nu goedkeuren of afkeuren.",
       );
     }
 
     if (overlappingUserIds.length) {
       summaryLines.push(
         `⚠️ Niet dubbel ingediend wegens een overlappende aanvraag: ${overlappingUserIds.map((userId) => `<@${userId}>`).join(", ")}.`,
-      );
-    }
-
-    if (session.skippedUserIds.length) {
-      summaryLines.push(
-        `⚠️ Overgeslagen omdat het geen geldig serverlid is: ${session.skippedUserIds.map((userId) => `<@${userId}>`).join(", ")}.`,
       );
     }
 
@@ -5013,12 +4975,6 @@ async function handleAbsenceFormModal(interaction) {
       summaryLines.push("ℹ️ Er zijn geen nieuwe aanvragen aangemaakt.");
     }
 
-    await interaction.message
-      ?.edit({
-        content: "✅ Het afwezigheidsformulier is verwerkt.",
-        components: [],
-      })
-      .catch(() => null);
     await interaction.editReply({
       content: summaryLines.join("\n"),
       allowedMentions: { parse: [] },
@@ -5221,14 +5177,6 @@ client.on(Events.InteractionCreate, (interaction) => {
     } else if (interaction.commandName === promotionCommand.name) {
       void handlePromotionCommand(interaction);
     }
-    return;
-  }
-
-  if (
-    interaction.isUserSelectMenu() &&
-    interaction.customId.startsWith("absence-form:")
-  ) {
-    void handleAbsenceFormUserSelection(interaction);
     return;
   }
 
@@ -5539,7 +5487,6 @@ module.exports = {
   absenceCommand,
   absenceRemoveCommand,
   buildAbsenceDetailsModal,
-  buildAbsenceUserSelectRow,
   buildPendingAbsenceEmbed,
   collectAttendance,
   collectAbsenceRecords,
