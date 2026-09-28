@@ -274,6 +274,12 @@ const resetActivityCommand = new SlashCommandBuilder()
   .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
   .setDMPermission(false);
 
+const cleanCommand = new SlashCommandBuilder()
+  .setName("clean")
+  .setDescription("Verwijder alle berichten uit het huidige kanaal.")
+  .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
+  .setDMPermission(false);
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -293,6 +299,7 @@ const absenceApprovalSourceIds = new Set();
 const absenceApprovalProcessingIds = new Set();
 const approvedAbsencesByMessageId = new Map();
 const pendingAbsencesByMessageId = new Map();
+const cleaningChannelIds = new Set();
 let refreshInProgress = false;
 let dashboardGuildId = null;
 let archiveTestSentThisSession = false;
@@ -2656,6 +2663,7 @@ async function registerCommands(guild) {
     sheetTestCommand,
     refreshAcceptedSheetCommand,
     promotionCommand,
+    cleanCommand,
   ];
 
   for (const commandBuilder of commandBuilders) {
@@ -2672,7 +2680,7 @@ async function registerCommands(guild) {
   }
 
   console.log(
-    "Slash-commands /afwezig, /afwezigverwijderen, /warn, /warnweg, /ban, /unban, /werkbijinactiviteit, /werkbijactiviteit, /resetinactiviteit, /resetactiviteit, /sheettest, /werkaangenomen en /promotie zijn geregistreerd.",
+    "Slash-commands /afwezig, /afwezigverwijderen, /warn, /warnweg, /ban, /unban, /werkbijinactiviteit, /werkbijactiviteit, /resetinactiviteit, /resetactiviteit, /sheettest, /werkaangenomen, /promotie en /clean zijn geregistreerd.",
   );
 }
 
@@ -4759,6 +4767,220 @@ async function handleDashboardResetCommand(interaction) {
   );
 }
 
+async function deleteAllChannelMessages(channel, onProgress = null) {
+  const failedMessageIds = new Set();
+  const bulkDeleteCutoff = Date.now() - 14 * 24 * 60 * 60 * 1_000;
+  let deletedCount = 0;
+  let bulkDeletedCount = 0;
+  let oldDeletedCount = 0;
+
+  for (let sweep = 0; sweep < 3; sweep += 1) {
+    let before;
+    let foundThisSweep = 0;
+    let deletedThisSweep = 0;
+
+    while (true) {
+      const messages = await channel.messages.fetch({
+        limit: 100,
+        ...(before ? { before } : {}),
+      });
+
+      if (!messages.size) break;
+
+      foundThisSweep += messages.size;
+      before = messages.last().id;
+      const bulkCandidates = messages.filter(
+        (message) =>
+          message.bulkDeletable && !failedMessageIds.has(message.id),
+      );
+      const singleCandidates = messages.filter(
+        (message) =>
+          !bulkCandidates.has(message.id) &&
+          !failedMessageIds.has(message.id),
+      );
+
+      if (bulkCandidates.size) {
+        try {
+          const deletedMessages = await channel.bulkDelete(
+            bulkCandidates,
+            true,
+          );
+          deletedCount += deletedMessages.size;
+          bulkDeletedCount += deletedMessages.size;
+          deletedThisSweep += deletedMessages.size;
+
+          for (const message of bulkCandidates.values()) {
+            if (!deletedMessages.has(message.id)) {
+              singleCandidates.set(message.id, message);
+            }
+          }
+        } catch (error) {
+          console.warn(
+            `Bulkverwijdering in kanaal ${channel.id} mislukte; de berichten worden één voor één geprobeerd:`,
+            error,
+          );
+
+          for (const message of bulkCandidates.values()) {
+            singleCandidates.set(message.id, message);
+          }
+        }
+      }
+
+      for (const message of singleCandidates.values()) {
+        try {
+          if (!message.deletable) {
+            failedMessageIds.add(message.id);
+            continue;
+          }
+
+          await message.delete();
+          deletedCount += 1;
+          if (message.createdTimestamp <= bulkDeleteCutoff) {
+            oldDeletedCount += 1;
+          }
+          deletedThisSweep += 1;
+          failedMessageIds.delete(message.id);
+        } catch (error) {
+          failedMessageIds.add(message.id);
+          console.warn(
+            `Bericht ${message.id} kon niet worden verwijderd uit kanaal ${channel.id}:`,
+            error,
+          );
+        }
+      }
+
+      if (onProgress) {
+        await onProgress({
+          deletedCount,
+          bulkDeletedCount,
+          oldDeletedCount,
+          failedCount: failedMessageIds.size,
+        });
+      }
+
+      if (messages.size < 100) break;
+    }
+
+    if (!foundThisSweep || !deletedThisSweep) break;
+  }
+
+  return {
+    deletedCount,
+    bulkDeletedCount,
+    oldDeletedCount,
+    failedCount: failedMessageIds.size,
+  };
+}
+
+async function handleCleanCommand(interaction) {
+  if (
+    !interaction.isChatInputCommand() ||
+    interaction.commandName !== cleanCommand.name
+  ) {
+    return;
+  }
+
+  if (
+    !interaction.inGuild() ||
+    !interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages)
+  ) {
+    await interaction.reply({
+      content: "❌ Je hebt de machtiging `Berichten beheren` nodig.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const channel = interaction.channel;
+
+  if (
+    !channel?.isTextBased() ||
+    !channel.messages ||
+    typeof channel.bulkDelete !== "function"
+  ) {
+    await interaction.editReply(
+      "❌ Dit kanaal ondersteunt het verwijderen van berichten niet.",
+    );
+    return;
+  }
+
+  if (cleaningChannelIds.has(channel.id)) {
+    await interaction.editReply(
+      "⏳ Dit kanaal wordt al schoongemaakt; er wordt geen tweede taak gestart.",
+    );
+    return;
+  }
+
+  const botMember =
+    interaction.guild.members.me ??
+    (await interaction.guild.members.fetchMe());
+  const botPermissions = channel.permissionsFor(botMember);
+
+  if (
+    !botPermissions?.has([
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.ReadMessageHistory,
+      PermissionFlagsBits.ManageMessages,
+    ])
+  ) {
+    await interaction.editReply(
+      "❌ De bot heeft in dit kanaal `Kanaal bekijken`, `Berichtgeschiedenis lezen` en `Berichten beheren` nodig.",
+    );
+    return;
+  }
+
+  cleaningChannelIds.add(channel.id);
+  let lastProgressUpdate = 0;
+
+  try {
+    const result = await deleteAllChannelMessages(
+      channel,
+      async (progress) => {
+        if (Date.now() - lastProgressUpdate < 5_000) return;
+        lastProgressUpdate = Date.now();
+        await interaction
+          .editReply(
+            `🧹 Bezig met schoonmaken… ${progress.deletedCount} berichten verwijderd, waarvan ${progress.oldDeletedCount} oude berichten.`,
+          )
+          .catch(() => null);
+      },
+    );
+
+    if (channel.id === CONFIG.absenceChannelId) {
+      pendingAbsencesByMessageId.clear();
+      approvedAbsencesByMessageId.clear();
+      void reconcileApprovedAbsenceRoles(interaction.guild).catch((error) => {
+        console.error(
+          "Afwezigheidsrollen konden na /clean niet worden bijgewerkt:",
+          error,
+        );
+      });
+    }
+
+    if (
+      channel.id === CONFIG.attendanceChannelId ||
+      channel.id === CONFIG.absenceChannelId
+    ) {
+      void refreshDashboard();
+    }
+
+    const failureText = result.failedCount
+      ? ` ${result.failedCount} bericht(en) konden niet worden verwijderd.`
+      : "";
+    await interaction.editReply(
+      `✅ Kanaal schoongemaakt: ${result.deletedCount} berichten verwijderd, inclusief ${result.oldDeletedCount} bericht(en) ouder dan de bulkverwijderingsgrens.${failureText}`,
+    );
+  } catch (error) {
+    console.error(`Kanaal ${channel.id} kon niet worden schoongemaakt:`, error);
+    await interaction
+      .editReply(`❌ Schoonmaken mislukt: ${error.message}`)
+      .catch(() => null);
+  } finally {
+    cleaningChannelIds.delete(channel.id);
+  }
+}
+
 async function getAbsenceTargetMember(interaction) {
   const user = interaction.options.getUser("persoon", true);
   const member =
@@ -5173,6 +5395,8 @@ client.on(Events.InteractionCreate, (interaction) => {
       void handleAcceptedRefreshCommand(interaction);
     } else if (interaction.commandName === promotionCommand.name) {
       void handlePromotionCommand(interaction);
+    } else if (interaction.commandName === cleanCommand.name) {
+      void handleCleanCommand(interaction);
     }
     return;
   }
@@ -5268,9 +5492,12 @@ client.on(Events.MessageUpdate, (_oldMessage, newMessage) => {
 });
 
 client.on(Events.MessageDelete, (message) => {
+  const isCleaningChannel = cleaningChannelIds.has(message.channelId);
+
   if (
-    message.channelId === CONFIG.attendanceChannelId ||
-    message.channelId === CONFIG.absenceChannelId
+    !isCleaningChannel &&
+    (message.channelId === CONFIG.attendanceChannelId ||
+      message.channelId === CONFIG.absenceChannelId)
   ) {
     void refreshDashboard();
   }
@@ -5281,7 +5508,7 @@ client.on(Events.MessageDelete, (message) => {
       message.id,
     );
 
-    if (removedApprovedRequest) {
+    if (removedApprovedRequest && !isCleaningChannel) {
       const guild = client.guilds.cache.get(dashboardGuildId);
 
       if (guild) void reconcileApprovedAbsenceRoles(guild);
@@ -5485,6 +5712,7 @@ module.exports = {
   absenceRemoveCommand,
   buildAbsenceDetailsModal,
   buildPendingAbsenceEmbed,
+  cleanCommand,
   collectAttendance,
   collectAbsenceRecords,
   collectLatestActivity,
@@ -5507,4 +5735,5 @@ module.exports = {
   parseAcceptedMemberMessages,
   parseCommandDateTime,
   parseDutchDateTime,
+  deleteAllChannelMessages,
 };
