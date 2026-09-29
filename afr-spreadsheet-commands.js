@@ -123,13 +123,10 @@ function maakAangenomenEmbed(member, data, interaction, bestaand = false) {
 }
 
 async function plaatsOpenbareMelding(interaction, payload) {
-  try {
-    return await interaction.followUp(payload);
-  } catch (followUpError) {
-    console.warn('Openbare interaction-follow-up mislukt, kanaalverzending wordt geprobeerd:', followUpError);
-    if (!interaction.channel?.isTextBased()) throw followUpError;
-    return interaction.channel.send(payload);
+  if (!interaction.channel?.isTextBased()) {
+    throw new Error('Dit kanaal ondersteunt geen openbare berichten.');
   }
+  return interaction.channel.send(payload);
 }
 
 async function haalBestaandeAangenomenMeldingenIn(interaction) {
@@ -201,9 +198,8 @@ async function handleAfrSpreadsheetCommand(interaction) {
     return true;
   }
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
   if (interaction.commandName === 'aangenomeninhalen') {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       const geplaatst = await haalBestaandeAangenomenMeldingenIn(interaction);
       await interaction.editReply(`\u2705 Voor ${geplaatst} bestaande leden is apart een welkomstmelding geplaatst.`);
@@ -212,6 +208,10 @@ async function handleAfrSpreadsheetCommand(interaction) {
       await interaction.editReply(`\u274C ${error.message}`);
     }
     return true;
+  }
+
+  if (interaction.commandName !== 'aangenomen') {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   }
 
   const member = interaction.options.getUser('lid', true);
@@ -257,12 +257,11 @@ async function handleAfrSpreadsheetCommand(interaction) {
     if (interaction.commandName === 'aangenomen') {
       let announcementError = null;
       try {
-        await plaatsOpenbareMelding(interaction, {
+        await interaction.reply({
           content: `${member}`,
           embeds: [maakAangenomenEmbed(member, data, interaction)],
           allowedMentions: { users: [member.id] },
         });
-        await interaction.editReply('\u2705 De welkomstmelding is direct in dit kanaal geplaatst. Google Sheets wordt bijgewerkt...');
       } catch (error) {
         announcementError = error;
         console.warn('Welkomstmelding kon niet worden geplaatst:', error);
@@ -281,13 +280,27 @@ async function handleAfrSpreadsheetCommand(interaction) {
         const sheetStatus = spreadsheetError
           ? `\u26A0\uFE0F Google Sheets is niet bijgewerkt: ${spreadsheetError.message}`
           : `\u2705 ${result.message}`;
-        await interaction.editReply(`${sheetStatus}\n\u274C De welkomstmelding kon niet worden geplaatst. Controleer mijn berichtrechten.`);
+        if (interaction.replied || interaction.deferred) {
+          await interaction.followUp({
+            content: `${sheetStatus}\n\u274C De welkomstmelding kon niet worden geplaatst. Controleer mijn berichtrechten.`,
+            flags: MessageFlags.Ephemeral,
+          });
+        } else {
+          await interaction.reply({
+            content: `${sheetStatus}\n\u274C De welkomstmelding kon niet worden geplaatst. Controleer mijn berichtrechten.`,
+            flags: MessageFlags.Ephemeral,
+          });
+        }
       } else if (spreadsheetError) {
-        await interaction.editReply(
-          `\u2705 De welkomstmelding is direct in dit kanaal geplaatst.\n\u26A0\uFE0F Google Sheets kon na 3 pogingen niet worden bijgewerkt: ${spreadsheetError.message}`,
-        );
+        await interaction.followUp({
+          content: `\u2705 De openbare welkomstmelding is geplaatst.\n\u26A0\uFE0F Google Sheets kon na 3 pogingen niet worden bijgewerkt: ${spreadsheetError.message}`,
+          flags: MessageFlags.Ephemeral,
+        });
       } else {
-        await interaction.editReply(`\u2705 De welkomstmelding is direct in dit kanaal geplaatst.\n\u2705 ${result.message}`);
+        await interaction.followUp({
+          content: `\u2705 De openbare welkomstmelding is geplaatst.\n\u2705 ${result.message}`,
+          flags: MessageFlags.Ephemeral,
+        });
       }
       return true;
     }
