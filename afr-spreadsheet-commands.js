@@ -20,7 +20,7 @@ const choices = values => values.map(value => ({ name: value, value }));
 
 const afrSpreadsheetCommands = [
   new SlashCommandBuilder()
-    .setName('aannemen')
+    .setName('aangenomen')
     .setDescription('Neem iemand aan en vul de volledige AFR-spreadsheetregel in')
     .addUserOption(o => o.setName('lid').setDescription('Het nieuwe teamlid').setRequired(true))
     .addStringOption(o => o.setName('naam').setDescription('Naam voor in de spreadsheet').setRequired(true))
@@ -60,7 +60,7 @@ const afrSpreadsheetCommands = [
     .setName('ontslag')
     .setDescription('Verwijder iemand uit de AFR-spreadsheet en maak de plek vrij')
     .addUserOption(o => o.setName('lid').setDescription('Het teamlid').setRequired(true)),
-].map(command => command.setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles).setDMPermission(false));
+].map(command => command.setDefaultMemberPermissions(null).setDMPermission(false));
 
 function magSpreadsheetBeheren(interaction) {
   if (interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) return true;
@@ -94,7 +94,7 @@ async function stuurNaarSpreadsheet(type, data) {
 }
 
 async function handleAfrSpreadsheetCommand(interaction) {
-  const supported = ['aannemen', 'promoveren', 'waarschuwing', 'afwezigheid', 'teamstatus', 'ontslag'];
+  const supported = ['aangenomen', 'promoveren', 'waarschuwing', 'afwezigheid', 'teamstatus', 'ontslag'];
   if (!interaction.isChatInputCommand() || !supported.includes(interaction.commandName)) return false;
 
   if (!interaction.inGuild() || !magSpreadsheetBeheren(interaction)) {
@@ -114,7 +114,7 @@ async function handleAfrSpreadsheetCommand(interaction) {
     let type;
     let data = common;
 
-    if (interaction.commandName === 'aannemen') {
+    if (interaction.commandName === 'aangenomen') {
       type = 'accepted';
       data = {
         ...common,
