@@ -114,6 +114,67 @@ replaceRequired(
   "bot daadwerkelijk starten",
 );
 
+replaceRequired(
+  `  if (message.channelId === CONFIG.absenceChannelId) {
+    if (
+      !message.author.bot &&
+      message.createdTimestamp >= CONFIG.absenceApprovalStartTimestamp
+    ) {
+      void processAbsenceTemplateMessage(message).catch((error) => {
+        console.error(
+          \`Afwezigheidstemplate \${message.id} kon niet worden omgezet:\`,
+          error,
+        );
+      });
+    } else {
+      void refreshDashboard();
+    }
+  }`,
+  `  if (message.channelId === CONFIG.absenceChannelId) {
+    void refreshDashboard();
+  }`,
+  "oude afwezigheidstemplate bij nieuwe berichten uitschakelen",
+);
+
+replaceRequired(
+  `  if (newMessage.channelId === CONFIG.absenceChannelId) {
+    if (
+      !newMessage.author?.bot &&
+      newMessage.createdTimestamp >= CONFIG.absenceApprovalStartTimestamp
+    ) {
+      void processAbsenceTemplateMessage(newMessage).catch((error) => {
+        console.error(
+          \`Bewerkte afwezigheidstemplate \${newMessage.id} kon niet worden omgezet:\`,
+          error,
+        );
+      });
+    } else {
+      void refreshDashboard();
+    }
+  }`,
+  `  if (newMessage.channelId === CONFIG.absenceChannelId) {
+    void refreshDashboard();
+  }`,
+  "oude afwezigheidstemplate bij bewerkte berichten uitschakelen",
+);
+
+replaceRequired(
+  `  try {
+    if (!dashboardGuild) {
+      throw new Error("De Discord-server kon niet worden gevonden.");
+    }
+
+    await migrateUnprocessedAbsenceTemplates(dashboardGuild);
+  } catch (error) {
+    console.error(
+      "Openstaande afwezigheidstemplates konden niet worden omgezet:",
+      erroq,
+    );
+  }`,
+  `  console.log("Oude afwezigheidstemplate is uitgeschakeld.");`,
+  "oude afwezigheidstemplates bij opstarten uitschakelen",
+);
+
 const runtimeModule = new Module(indexPath, module);
 runtimeModule.filename = indexPath;
 runtimeModule.paths = Module._nodeModulePaths(__dirname);
