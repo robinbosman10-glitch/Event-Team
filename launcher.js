@@ -74,6 +74,12 @@ replaceRequired(
   "spreadsheet-opstartmelding",
 );
 
+replaceRequired(
+  "if (require.main === module) void startBot();",
+  "void startBot();",
+  "bot daadwerkelijk starten",
+);
+
 const runtimeModule = new Module(indexPath, module);
 runtimeModule.filename = indexPath;
 runtimeModule.paths = Module._nodeModulePaths(__dirname);
