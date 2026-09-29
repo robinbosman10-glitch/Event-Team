@@ -61,6 +61,10 @@ const afrSpreadsheetCommands = [
     .setName('ontslag')
     .setDescription('Verwijder iemand uit de AFR-spreadsheet en maak de plek vrij')
     .addUserOption(o => o.setName('lid').setDescription('Het teamlid').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('aangenomeninhalen')
+    .setDescription('Plaats voor alle bestaande spreadsheetleden apart een welkomstmelding'),
 ].map(command => command.setDefaultMemberPermissions(null).setDMPermission(false));
 
 function magSpreadsheetBeheren(interaction) {
@@ -90,29 +94,58 @@ function rangKleur(rank) {
   return 0x57D68D;
 }
 
-function maakAangenomenEmbed(member, data, interaction) {
-  return new EmbedBuilder()
+function maakAangenomenEmbed(member, data, interaction, bestaand = false) {
+  const mention = member ? `${member}` : `<@${data.discordId}>`;
+  const embed = new EmbedBuilder()
     .setColor(rangKleur(data.rank))
     .setAuthor({
       name: 'AFR Event Team',
       iconURL: interaction.guild?.iconURL({ size: 256 }) || undefined,
     })
-    .setTitle('🎉 Nieuw Event Team-lid aangenomen!')
+    .setTitle(bestaand ? 'ð Event Team-lid!' : 'ð Nieuw Event Team-lid aangenomen!')
     .setDescription(
-      `Van harte welkom ${member} bij het **AFR Event Team**!\n` +
-      'We wensen je veel succes en vooral veel plezier binnen het team. 💚',
+      `Van harte welkom ${mention} bij het **AFR Event Team**!\n` +
+      'We wensen je veel succes en vooral veel plezier binnen het team. ð',
     )
     .addFields(
-      { name: '👤 Naam', value: data.name, inline: true },
-      { name: '🏷️ Rang', value: data.rank, inline: true },
-      { name: '🟢 Status', value: data.status, inline: true },
-      { name: '📅 Aangenomen op', value: data.acceptedDate, inline: true },
-      { name: '🤝 Aangenomen door', value: data.acceptedBy, inline: true },
-      { name: '🆔 Discord ID', value: member.id, inline: true },
+      { name: 'ð¤ Naam', value: data.name, inline: true },
+      { name: 'ð·ï¸ Rang', value: data.rank, inline: true },
+      { name: 'ð¢ Status', value: data.status, inline: true },
+      { name: 'ð Aangenomen op', value: data.acceptedDate, inline: true },
+      { name: 'ð¤ Aangenomen door', value: data.acceptedBy, inline: true },
+      { name: 'ð Discord ID', value: data.discordId || member?.id || 'Onbekend', inline: true },
     )
-    .setThumbnail(member.displayAvatarURL({ size: 256 }))
-    .setFooter({ text: `AFR Event Team • Welkom ${data.name}!` })
+    .setFooter({ text: `AFR Event Team â¢ Welkom ${data.name}!` })
     .setTimestamp();
+
+  if (member) embed.setThumbnail(member.displayAvatarURL({ size: 256 }));
+  return embed;
+}
+
+async function haalBestaandeAangenomenMeldingenIn(interaction) {
+  const result = await stuurNaarSpreadsheet('members', {
+    actorId: interaction.user.id,
+    actorName: interaction.member?.displayName || interaction.user.username,
+  });
+  const members = Array.isArray(result?.members) ? result.members : [];
+  if (!members.length) throw new Error('Er staan geen ingevulde leden in de spreadsheet.');
+  if (!interaction.channel?.isTextBased()) throw new Error('Dit kanaal ondersteunt geen berichten.');
+
+  let geplaatst = 0;
+  for (const data of members) {
+    const member = await interaction.client.users.fetch(data.discordId).catch(() => null);
+    await interaction.channel.send({
+      content: `<@${data.discordId}>`,
+      embeds: [maakAangenomenEmbed(member, data, interaction, true)],
+      allowedMentions: { users: [data.discordId] },
+    });
+    geplaatst += 1;
+    if (geplaatst < members.length) {
+      await new Promise(resolve => setTimeout(resolve, 750));
+    }
+  }
+
+  return geplaatst;
 }
 
 async function stuurNaarSpreadsheet(type, data) {
@@ -120,18 +153,38 @@ async function stuurNaarSpreadsheet(type, data) {
   const secret = process.env.SHEET_WEBHOOK_SECRET;
   if (!url || !secret) throw new Error('SHEET_WEBHOOK_URL of SHEET_WEBHOOK_SECRET ontbreekt in Railway.');
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ secret, type, data }),
-  });
-  const payload = await response.json().catch(() => null);
-  if (!response.ok || !payload?.ok) throw new Error(payload?.error || `Spreadsheetfout (${response.status}).`);
-  return payload.result;
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        redirect: 'follow',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ secret, type, data }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      const payload = await response.json().catch(() => null);
+
+      if (response.ok && payload?.ok) return payload.result;
+
+      const message = payload?.error || `Spreadsheetfout (${response.status}).`;
+      lastError = new Error(message);
+      const tijdelijk = response.status === 404 || response.status === 408 ||
+        response.status === 429 || response.status >= 500;
+      if (!tijdelijk || attempt === 3) throw lastError;
+    } catch (error) {
+      lastError = error;
+      if (attempt === 3) break;
+    }
+
+    await new Promise(resolve => setTimeout(resolve, attempt * 1_500));
+  }
+
+  throw new Error(`Google Sheets reageerde na 3 pogingen niet goed: ${lastError?.message || lastError}`);
 }
 
 async function handleAfrSpreadsheetCommand(interaction) {
-  const supported = ['aangenomen', 'promoveren', 'waarschuwing', 'afwezigheid', 'teamstatus', 'ontslag'];
+  const supported = ['aangenomen', 'aangenomeninhalen', 'promoveren', 'waarschuwing', 'afwezigheid', 'teamstatus', 'ontslag'];
   if (!interaction.isChatInputCommand() || !supported.includes(interaction.commandName)) return false;
 
   if (!interaction.inGuild() || !magSpreadsheetBeheren(interaction)) {
@@ -140,6 +193,18 @@ async function handleAfrSpreadsheetCommand(interaction) {
   }
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  if (interaction.commandName === 'aangenomeninhalen') {
+    try {
+      const geplaatst = await haalBestaandeAangenomenMeldingenIn(interaction);
+      await interaction.editReply(`â Voor ${geplaatst} bestaande leden is apart een welkomstmelding geplaatst.`);
+    } catch (error) {
+      console.error('Bestaande aangenomen-meldingen inhalen mislukt:', error);
+      await interaction.editReply(`â ${error.message}`);
+    }
+    return true;
+  }
+
   const member = interaction.options.getUser('lid', true);
   const common = {
     discordId: member.id,
@@ -180,7 +245,15 @@ async function handleAfrSpreadsheetCommand(interaction) {
       type = 'terminated';
     }
 
-    const result = await stuurNaarSpreadsheet(type, data);
+    let result = null;
+    let spreadsheetError = null;
+    try {
+      result = await stuurNaarSpreadsheet(type, data);
+    } catch (error) {
+      spreadsheetError = error;
+      if (interaction.commandName !== 'aangenomen') throw error;
+      console.warn('Aangenomen-melding wordt geplaatst ondanks spreadsheetfout:', error);
+    }
 
     if (interaction.commandName === 'aangenomen') {
       try {
@@ -192,19 +265,26 @@ async function handleAfrSpreadsheetCommand(interaction) {
           embeds: [maakAangenomenEmbed(member, data, interaction)],
           allowedMentions: { users: [member.id] },
         });
-        await interaction.editReply(`✅ ${result.message}\n✅ De welkomstmelding is in dit kanaal geplaatst.`);
+        if (spreadsheetError) {
+          await interaction.editReply(
+            `â De welkomstmelding is in dit kanaal geplaatst.\nâ ï¸ Google Sheets kon na 3 pogingen niet worden bijgewerkt: ${spreadsheetError.message}`,
+          );
+        } else {
+          await interaction.editReply(`â ${result.message}\nâ De welkomstmelding is in dit kanaal geplaatst.`);
+        }
       } catch (announcementError) {
         console.warn('Welkomstmelding kon niet worden geplaatst:', announcementError);
-        await interaction.editReply(
-          `✅ ${result.message}\n⚠️ De spreadsheet is bijgewerkt, maar ik kon de welkomstmelding niet in dit kanaal plaatsen. Controleer mijn berichtrechten.`,
-        );
+        const sheetStatus = spreadsheetError
+          ? `â ï¸ Google Sheets is niet bijgewerkt: ${spreadsheetError.message}`
+          : `â ${result.message}`;
+        await interaction.editReply(`${sheetStatus}\nâ ï¸ De welkomstmelding kon niet worden geplaatst. Controleer mijn berichtrechten.`);
       }
     } else {
-      await interaction.editReply(`✅ ${result.message}`);
+      await interaction.editReply(`â ${result.message}`);
     }
   } catch (error) {
     console.error('AFR spreadsheetactie mislukt:', error);
-    await interaction.editReply(`❌ ${error.message}`);
+    await interaction.editReply(`â ${error.message}`);
   }
   return true;
 }
