@@ -89,6 +89,26 @@ replaceRequired(
 );
 
 replaceRequired(
+  "    await loadAllGuildMembers(dashboardGuild);",
+  `    await loadAllGuildMembers(dashboardGuild);
+    console.log("Spreadsheetkoppeling direct controleren...");
+    void sendSpreadsheetEvent("ping", {
+      actorId: readyClient.user.id,
+      actorName: readyClient.user.username,
+      source: "startup-direct",
+    })
+      .then((spreadsheet) => {
+        if (spreadsheet) {
+          console.log(\`Spreadsheet verbonden: \${spreadsheet.sheetName}.\`);
+        }
+      })
+      .catch((error) => {
+        console.warn(\`Spreadsheetkoppeling mislukt: \${error.message || error}\`);
+      });`,
+  "spreadsheetcontrole vóór commandregistratie",
+);
+
+replaceRequired(
   "if (require.main === module) void startBot();",
   "void startBot();",
   "bot daadwerkelijk starten",
