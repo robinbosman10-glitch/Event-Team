@@ -75,6 +75,20 @@ replaceRequired(
 );
 
 replaceRequired(
+  "    await restoreBlacklistRolesForGuild(dashboardGuild);",
+  `    void restoreBlacklistRolesForGuild(dashboardGuild).catch((error) => {
+      console.warn(\`Blacklistcontrole overgeslagen: \${error.message || error}\`);
+    });`,
+  "blacklistcontrole op de achtergrond",
+);
+
+replaceRequired(
+  '    const spreadsheet = await sendSpreadsheetEvent("ping", {',
+  '    console.log("Spreadsheetkoppeling controleren...");\n    const spreadsheet = await sendSpreadsheetEvent("ping", {',
+  "zichtbare spreadsheetcontrole",
+);
+
+replaceRequired(
   "if (require.main === module) void startBot();",
   "void startBot();",
   "bot daadwerkelijk starten",
