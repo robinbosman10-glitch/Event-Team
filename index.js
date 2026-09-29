@@ -20,6 +20,10 @@ const {
   TextInputStyle,
   UserSelectMenuBuilder,
 } = require("discord.js");
+const {
+  afrSpreadsheetCommands,
+  handleAfrSpreadsheetCommand,
+} = require("./afr-spreadsheet-commands");
 
 process.env.TZ = "Europe/Amsterdam";
 
@@ -2649,20 +2653,30 @@ function scheduleDashboardUpdates() {
 
 async function registerCommands(guild) {
   const commands = await guild.commands.fetch();
+  const obsoleteCommandNames = new Set([
+    "werkaangenomen",
+    "warnweg",
+    "warn",
+    "sheettest",
+    "promotie",
+  ]);
+
+  for (const command of commands.values()) {
+    if (obsoleteCommandNames.has(command.name)) {
+      await command.delete();
+    }
+  }
+
   const commandBuilders = [
     absenceCommand,
     absenceRemoveCommand,
-    warningCommand,
-    warningRemoveCommand,
     banCommand,
     unbanCommand,
     refreshInactivityCommand,
     refreshActivityCommand,
     resetInactivityCommand,
     resetActivityCommand,
-    sheetTestCommand,
-    refreshAcceptedSheetCommand,
-    promotionCommand,
+    ...afrSpreadsheetCommands,
     cleanCommand,
   ];
 
@@ -2680,7 +2694,7 @@ async function registerCommands(guild) {
   }
 
   console.log(
-    "Slash-commands /afwezig, /afwezigverwijderen, /warn, /warnweg, /ban, /unban, /werkbijinactiviteit, /werkbijactiviteit, /resetinactiviteit, /resetactiviteit, /sheettest, /werkaangenomen, /promotie en /clean zijn geregistreerd.",
+    "Slash-commands inclusief het nieuwe AFR-spreadsheetbeheer zijn geregistreerd; oude spreadsheetcommands zijn verwijderd.",
   );
 }
 
@@ -5365,16 +5379,14 @@ async function handleAbsenceRemovalCommand(interaction) {
   }
 }
 
-client.on(Events.InteractionCreate, (interaction) => {
+client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.isChatInputCommand()) {
-    if (interaction.commandName === absenceCommand.name) {
+    if (await handleAfrSpreadsheetCommand(interaction)) {
+      return;
+    } else if (interaction.commandName === absenceCommand.name) {
       void handleAbsenceCommand(interaction);
     } else if (interaction.commandName === absenceRemoveCommand.name) {
       void handleAbsenceRemovalCommand(interaction);
-    } else if (interaction.commandName === warningCommand.name) {
-      void handleWarningCommand(interaction);
-    } else if (interaction.commandName === warningRemoveCommand.name) {
-      void handleWarningRemoveCommand(interaction);
     } else if (interaction.commandName === banCommand.name) {
       void handleBanCommand(interaction);
     } else if (interaction.commandName === unbanCommand.name) {
@@ -5389,12 +5401,6 @@ client.on(Events.InteractionCreate, (interaction) => {
       interaction.commandName === resetActivityCommand.name
     ) {
       void handleDashboardResetCommand(interaction);
-    } else if (interaction.commandName === sheetTestCommand.name) {
-      void handleSheetTestCommand(interaction);
-    } else if (interaction.commandName === refreshAcceptedSheetCommand.name) {
-      void handleAcceptedRefreshCommand(interaction);
-    } else if (interaction.commandName === promotionCommand.name) {
-      void handlePromotionCommand(interaction);
     } else if (interaction.commandName === cleanCommand.name) {
       void handleCleanCommand(interaction);
     }

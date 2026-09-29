@@ -1,741 +1,415 @@
 /**
- * AFR Event Team – Discord/Google Sheets-koppeling
- *
- * Installatie:
- * 1. Open de AFR-spreadsheet.
- * 2. Kies Extensies > Apps Script en plak dit hele bestand in Code.gs.
- * 3. Voer setupSpreadsheetWebhook één keer uit en kopieer de secret uit het uitvoeringslog.
- * 4. Kies Implementeren > Nieuwe implementatie > Web-app.
- * 5. Uitvoeren als: ikzelf. Toegang: iedereen.
- * 6. Zet de /exec-URL als SHEET_WEBHOOK_URL bij de bot.
- * 7. Zet de gekopieerde secret als SHEET_WEBHOOK_SECRET bij de bot.
+ * AFR Event Team – nieuwe Google Sheets-koppeling
+ * Voor de spreadsheet met tabblad "AFR Event Team" en kolommen:
+ * Rang, Naam, Discord ID, Status, Aangenomen op, Aangenomen door,
+ * Waarschuwingen, Sollicitatie behandelaar en Afwezig.
  */
 
-const AFR_SHEET_GID = 0;
-const AFR_SPREADSHEET_ID_PROPERTY = "AFR_SPREADSHEET_ID";
-const AFR_SECRET_PROPERTY = "AFR_SHEET_WEBHOOK_SECRET";
-const AFR_HEADER_SEARCH_ROWS = 20;
-const AFR_ACCEPTED_COLUMNS = Object.freeze({
-  name: 3,
-  discordId: 4,
-  status: 5,
-  acceptedDate: 6,
-  lastChanged: 7,
-  changedBy: 8,
-  acceptedBy: 9,
-  staffRank: 11,
-});
-const AFR_STAFF_RANKS = Object.freeze([
-  "Hoge Raad",
-  "Hoofd Management",
-  "Management",
-  "Junior Management",
-  "Senior Admin",
-  "Admin",
-  "Junior Admin",
-  "Senior Moderator",
-  "Moderator",
-  "Junior Moderator",
-  "N.V.T.",
-]);
+const AFR_TABBLAD = "AFR Event Team";
+const AFR_LOGBLAD = "Automatisering Logboek";
+const AFR_SECRET_KEY = "AFR_NIEUWE_SHEET_SECRET";
+const AFR_SPREADSHEET_KEY = "AFR_NIEUWE_SPREADSHEET_ID";
 
-function setupSpreadsheetWebhook() {
+function setupAfrKoppeling() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  if (!spreadsheet) throw new Error("Open dit script vanuit de nieuwe AFR-spreadsheet.");
+
+  const sheet = spreadsheet.getSheetByName(AFR_TABBLAD);
+  if (!sheet) throw new Error(`Tabblad '${AFR_TABBLAD}' is niet gevonden.`);
+
+  spreadsheet.setSpreadsheetTimeZone("Europe/Amsterdam");
   const secret = `${Utilities.getUuid()}${Utilities.getUuid()}`.replace(/-/g, "");
-  const spreadsheetId = SpreadsheetApp.getActiveSpreadsheet().getId();
-
   PropertiesService.getScriptProperties().setProperties({
-    [AFR_SPREADSHEET_ID_PROPERTY]: spreadsheetId,
-    [AFR_SECRET_PROPERTY]: secret,
+    [AFR_SPREADSHEET_KEY]: spreadsheet.getId(),
+    [AFR_SECRET_KEY]: secret,
   });
+
+  maakSollicitatieVinkjes_(sheet);
+  haalLogblad_(spreadsheet);
+
   console.log(`SHEET_WEBHOOK_SECRET=${secret}`);
-  return "Klaar. Spreadsheet-ID is privé opgeslagen. Kopieer SHEET_WEBHOOK_SECRET uit het uitvoeringslog.";
+  console.log(`SPREADSHEET_ID=${spreadsheet.getId()}`);
+  return "Koppeling ingesteld. Kopieer SHEET_WEBHOOK_SECRET uit het uitvoeringslog.";
 }
 
 function doGet() {
-  const spreadsheetId = getSpreadsheetId_();
-  const spreadsheet = SpreadsheetApp.openById(spreadsheetId);
-  const sheet = getConfiguredSheet_(spreadsheet);
-
-  return jsonResponse_({
-    ok: true,
-    service: "AFR spreadsheet webhook",
-    sheetGid: AFR_SHEET_GID,
-    sheet: sheet ? sheet.getName() : null,
-  });
+  try {
+    const context = haalContext_();
+    return json_({
+      ok: true,
+      service: "AFR Event Team nieuwe spreadsheetkoppeling",
+      spreadsheetId: context.spreadsheet.getId(),
+      sheet: context.sheet.getName(),
+      headerRow: context.headerRow,
+      lastRow: context.lastRow,
+    });
+  } catch (error) {
+    return json_({ ok: false, error: error.message });
+  }
 }
 
 function doPost(event) {
   const lock = LockService.getScriptLock();
-
   try {
     lock.waitLock(30000);
-    const requestBody =
-      event && event.postData ? event.postData.contents : "{}";
-    const request = JSON.parse(requestBody || "{}");
-    const expectedSecret = PropertiesService.getScriptProperties().getProperty(
-      AFR_SECRET_PROPERTY,
-    );
+    const request = JSON.parse(event && event.postData ? event.postData.contents : "{}");
+    const secret = PropertiesService.getScriptProperties().getProperty(AFR_SECRET_KEY);
+    if (!secret || request.secret !== secret) throw new Error("Ongeldige webhook-secret.");
 
-    if (!expectedSecret || request.secret !== expectedSecret) {
-      throw new Error("Ongeldige webhook-secret.");
-    }
-
-    const result = processDiscordEvent_(request.type, request.data || {});
+    const result = verwerkActie_(String(request.type || ""), request.data || {});
     SpreadsheetApp.flush();
-    return jsonResponse_({ ok: true, result });
+    return json_({ ok: true, result });
   } catch (error) {
     console.error(error.stack || error);
-    return jsonResponse_({ ok: false, error: error.message });
+    return json_({ ok: false, error: error.message });
   } finally {
     if (lock.hasLock()) lock.releaseLock();
   }
 }
 
-function processDiscordEvent_(type, data) {
-  const context = getSheetContext_();
+function verwerkActie_(type, data) {
+  const context = haalContext_();
+  let result;
 
   switch (type) {
     case "ping":
       return {
+        spreadsheetId: context.spreadsheet.getId(),
+        sheet: context.sheet.getName(),
         sheetName: context.sheet.getName(),
         headerRow: context.headerRow,
-        lastDataRow: context.lastDataRow,
+        lastDataRow: context.lastRow,
+        rows: context.lastRow - context.firstRow + 1,
       };
     case "accepted":
-      return applyAccepted_(context, data);
-    case "rank_changed":
-      return applyRankChange_(context, data);
-    case "warning":
-      return applyWarning_(context, data);
-    case "warning_removed":
-      return applyWarningRemoval_(context, data);
+      result = neemAan_(context, data);
+      break;
+    case "promoted":
+      result = promoveer_(context, data);
+      break;
+    case "warning_set":
+      result = stelWaarschuwingIn_(context, data);
+      break;
+    case "absence_changed":
+      result = stelAfwezigheidIn_(context, data);
+      break;
+    case "status_changed":
+      result = stelStatusIn_(context, data);
+      break;
     case "terminated":
-      return applyTermination_(context, data);
-    case "departed":
-      return applyDeparture_(context, data, "Uit dienst");
+      result = ontsla_(context, data);
+      break;
     default:
-      throw new Error(`Onbekend gebeurtenistype: ${type}`);
+      throw new Error(`Onbekende actie '${type}'.`);
   }
+
+  schrijfLog_(context.spreadsheet, type, data, result);
+  return result;
 }
 
-function getSheetContext_() {
-  const spreadsheet = SpreadsheetApp.openById(getSpreadsheetId_());
-  const sheet = getConfiguredSheet_(spreadsheet);
+function haalContext_() {
+  const properties = PropertiesService.getScriptProperties();
+  const spreadsheetId = properties.getProperty(AFR_SPREADSHEET_KEY);
+  if (!spreadsheetId) throw new Error("Voer setupAfrKoppeling eerst één keer uit.");
 
-  if (!sheet) throw new Error(`Tabblad met gid=${AFR_SHEET_GID} niet gevonden.`);
+  const spreadsheet = SpreadsheetApp.openById(spreadsheetId);
+  const sheet = spreadsheet.getSheetByName(AFR_TABBLAD);
+  if (!sheet) throw new Error(`Tabblad '${AFR_TABBLAD}' is niet gevonden.`);
 
-  const searchRows = Math.min(AFR_HEADER_SEARCH_ROWS, sheet.getMaxRows());
-  const searchColumns = Math.min(30, sheet.getMaxColumns());
-  const displayed = sheet
-    .getRange(1, 1, searchRows, searchColumns)
-    .getDisplayValues();
+  const values = sheet.getRange(1, 1, Math.min(25, sheet.getMaxRows()), sheet.getMaxColumns()).getDisplayValues();
   let headerRow = 0;
   let headers = {};
 
-  for (let rowIndex = 0; rowIndex < displayed.length; rowIndex += 1) {
+  for (let r = 0; r < values.length; r += 1) {
     const candidate = {};
-
-    displayed[rowIndex].forEach((value, columnIndex) => {
-      const key = normalizeHeader_(value);
-      if (key) candidate[key] = columnIndex + 1;
+    values[r].forEach((value, index) => {
+      const key = normaliseerKop_(value);
+      if (key) candidate[key] = index + 1;
     });
-
-    if (candidate.rang && candidate.naam && candidate.discordid) {
-      headerRow = rowIndex + 1;
+    if (candidate.rang && candidate.naam && candidate.discordid && candidate.status) {
+      headerRow = r + 1;
       headers = candidate;
       break;
     }
   }
 
-  if (!headerRow) {
-    throw new Error("Kolomkoppen Rang, Naam en Discord ID zijn niet gevonden.");
-  }
-
+  if (!headerRow) throw new Error("De categorie-koppen zijn niet gevonden.");
   return {
     spreadsheet,
     sheet,
-    headerRow,
-    firstDataRow: headerRow + 1,
-    lastDataRow: sheet.getLastRow(),
     headers,
+    headerRow,
+    firstRow: headerRow + 1,
+    lastRow: sheet.getLastRow(),
   };
 }
 
-function getSpreadsheetId_() {
-  const spreadsheetId = PropertiesService.getScriptProperties().getProperty(
-    AFR_SPREADSHEET_ID_PROPERTY,
-  );
+function neemAan_(context, data) {
+  verplicht_(data.discordId, "Discord-lid");
+  verplicht_(data.name, "Naam");
+  const rank = data.rank || data.rankName;
+  const acceptedBy = data.acceptedBy || data.acceptedByName;
+  verplicht_(rank, "Rang");
+  verplicht_(acceptedBy, "Aangenomen door");
 
-  if (!spreadsheetId) {
-    throw new Error(
-      "Spreadsheet-ID ontbreekt. Voer setupSpreadsheetWebhook één keer uit vanuit de gekoppelde spreadsheet.",
-    );
-  }
+  const row = zorgVoorRang_(context, data.discordId, rank);
+  zetWaarde_(context, row, "Naam", data.name);
+  zetWaarde_(context, row, "Discord ID", String(data.discordId));
+  zetKeuze_(context, row, "Status", data.status || "Actief");
+  zetWaarde_(context, row, "Aangenomen op", parseDatum_(data.acceptedDate));
+  zetKeuze_(context, row, "Aangenomen door", acceptedBy);
+  zetKeuze_(context, row, "Waarschuwingen", data.warnings || "Geen");
+  zetVinkje_(context, row, "Sollicitatie behandelaar", Boolean(data.applicationHandler));
+  zetKeuze_(context, row, "Afwezig", data.absent ? "Ja" : "Nee");
 
-  return spreadsheetId;
+  return { message: `Volledige spreadsheetregel ingevuld op rij ${row}.`, row };
 }
 
-function getConfiguredSheet_(spreadsheet) {
-  const sheets = spreadsheet.getSheets();
+function promoveer_(context, data) {
+  verplicht_(data.discordId, "Discord-lid");
+  verplicht_(data.newRank, "Nieuwe rang");
+  const oldRow = vindLidRij_(context, data.discordId);
+  if (!oldRow) throw new Error(`Discord-ID ${data.discordId} staat niet in de spreadsheet.`);
 
-  for (let index = 0; index < sheets.length; index += 1) {
-    if (sheets[index].getSheetId() === AFR_SHEET_GID) return sheets[index];
+  const row = zorgVoorRang_(context, data.discordId, data.newRank);
+  zetKeuze_(context, row, "Status", "Actief");
+  return { message: `Gepromoveerd naar ${data.newRank}; gegevens staan op rij ${row}.`, row };
+}
+
+function stelWaarschuwingIn_(context, data) {
+  const row = vereisLidRij_(context, data.discordId);
+  zetKeuze_(context, row, "Waarschuwingen", data.warning || "Geen");
+  return { message: `Waarschuwing aangepast naar ${data.warning || "Geen"} op rij ${row}.`, row };
+}
+
+function stelAfwezigheidIn_(context, data) {
+  const row = vereisLidRij_(context, data.discordId);
+  zetKeuze_(context, row, "Afwezig", data.absent ? "Ja" : "Nee");
+  return { message: `Afwezig aangepast naar ${data.absent ? "Ja" : "Nee"} op rij ${row}.`, row };
+}
+
+function stelStatusIn_(context, data) {
+  const row = vereisLidRij_(context, data.discordId);
+  zetKeuze_(context, row, "Status", data.status || "Actief");
+  return { message: `Status aangepast naar ${data.status || "Actief"} op rij ${row}.`, row };
+}
+
+function ontsla_(context, data) {
+  const row = vereisLidRij_(context, data.discordId);
+  maakLidRijLeeg_(context, row);
+  return { message: `Lid verwijderd; plek op rij ${row} is weer vrij.`, row };
+}
+
+function zorgVoorRang_(context, discordId, rank) {
+  const sourceRow = vindLidRij_(context, discordId);
+  if (sourceRow) {
+    const currentRank = context.sheet.getRange(sourceRow, context.headers.rang).getDisplayValue();
+    if (rangScore_(currentRank, rank) >= 0.75) return sourceRow;
   }
 
+  const destinationRow = vindVrijeRangRij_(context, rank);
+  if (sourceRow) verplaatsLid_(context, sourceRow, destinationRow);
+  return destinationRow;
+}
+
+function vindLidRij_(context, discordId) {
+  const wanted = normaliseerDiscordId_(discordId);
+  const count = context.lastRow - context.firstRow + 1;
+  if (!wanted || count < 1) return null;
+  const ids = context.sheet.getRange(context.firstRow, context.headers.discordid, count, 1).getDisplayValues();
+  const index = ids.findIndex(([value]) => normaliseerDiscordId_(value) === wanted);
+  return index < 0 ? null : context.firstRow + index;
+}
+
+function vereisLidRij_(context, discordId) {
+  verplicht_(discordId, "Discord-lid");
+  const row = vindLidRij_(context, discordId);
+  if (!row) throw new Error(`Discord-ID ${discordId} staat niet in de spreadsheet.`);
+  return row;
+}
+
+function vindVrijeRangRij_(context, rank) {
+  const count = context.lastRow - context.firstRow + 1;
+  const ranks = context.sheet.getRange(context.firstRow, context.headers.rang, count, 1).getDisplayValues();
+  const ids = context.sheet.getRange(context.firstRow, context.headers.discordid, count, 1).getDisplayValues();
+  const candidates = ranks.map(([value], index) => ({
+    row: context.firstRow + index,
+    score: rangScore_(value, rank),
+    empty: !normaliseerDiscordId_(ids[index][0]),
+  })).filter(item => item.empty && item.score >= 0.75)
+    .sort((a, b) => b.score - a.score || a.row - b.row);
+
+  if (!candidates.length) throw new Error(`Rang '${rank}' heeft geen vrije plek meer.`);
+  return candidates[0].row;
+}
+
+function verplaatsLid_(context, sourceRow, destinationRow) {
+  if (sourceRow === destinationRow) return;
+  Object.entries(context.headers).forEach(([header, column]) => {
+    if (header === "rang") return;
+    const source = context.sheet.getRange(sourceRow, column);
+    const destination = context.sheet.getRange(destinationRow, column);
+    if (header === "sollicitatiebehandelaar") {
+      zetVinkjeOpCel_(destination, Boolean(source.getValue()));
+    } else {
+      const value = source.getValue();
+      const allowed = toegestaneWaarden_(destination);
+      if (allowed) zetKeuzeOpCel_(destination, value);
+      else destination.setValue(value);
+    }
+  });
+  maakLidRijLeeg_(context, sourceRow);
+}
+
+function maakLidRijLeeg_(context, row) {
+  Object.entries(context.headers).forEach(([header, column]) => {
+    if (header === "rang") return;
+    const cell = context.sheet.getRange(row, column);
+    if (header === "waarschuwingen") zetKeuzeOpCel_(cell, "Geen");
+    else if (header === "afwezig") zetKeuzeOpCel_(cell, "Nee");
+    else if (header === "sollicitatiebehandelaar") zetVinkjeOpCel_(cell, false);
+    else cell.clearContent();
+  });
+}
+
+function zetWaarde_(context, row, header, value) {
+  const column = context.headers[normaliseerKop_(header)];
+  if (!column) throw new Error(`Kolom '${header}' ontbreekt.`);
+  context.sheet.getRange(row, column).setValue(value);
+}
+
+function zetKeuze_(context, row, header, value) {
+  const column = context.headers[normaliseerKop_(header)];
+  if (!column) throw new Error(`Kolom '${header}' ontbreekt.`);
+  zetKeuzeOpCel_(context.sheet.getRange(row, column), value);
+}
+
+function zetKeuzeOpCel_(cell, value) {
+  const allowed = toegestaneWaarden_(cell);
+  if (!allowed) {
+    cell.setValue(value);
+    return;
+  }
+  const wanted = normaliseerTekst_(value);
+  const match = allowed.find(option => normaliseerTekst_(option) === wanted) ||
+    allowed.find(option => normaliseerTekst_(option).includes(wanted) || wanted.includes(normaliseerTekst_(option)));
+  if (!match) throw new Error(`Waarde '${value}' staat niet in het dropdownmenu van ${cell.getA1Notation()}.`);
+  cell.setValue(match);
+}
+
+function zetVinkje_(context, row, header, value) {
+  const column = context.headers[normaliseerKop_(header)];
+  if (!column) throw new Error(`Kolom '${header}' ontbreekt.`);
+  zetVinkjeOpCel_(context.sheet.getRange(row, column), value);
+}
+
+function zetVinkjeOpCel_(cell, value) {
+  const merged = cell.getMergedRanges();
+  const target = merged.length ? merged[0] : cell;
+  const rule = target.getDataValidation();
+  if (!rule || rule.getCriteriaType() !== SpreadsheetApp.DataValidationCriteria.CHECKBOX) {
+    target.insertCheckboxes();
+  }
+  target.setValue(Boolean(value));
+  target.setHorizontalAlignment("center");
+}
+
+function maakSollicitatieVinkjes_(sheet) {
+  const tempContext = haalContextVoorSetup_(sheet);
+  const column = tempContext.headers.sollicitatiebehandelaar;
+  if (!column) throw new Error("Kolom 'Sollicitatie behandelaar' ontbreekt.");
+  for (let row = tempContext.firstRow; row <= tempContext.lastRow; row += 1) {
+    const rank = sheet.getRange(row, tempContext.headers.rang).getDisplayValue();
+    if (rank) zetVinkjeOpCel_(sheet.getRange(row, column), false);
+  }
+}
+
+function haalContextVoorSetup_(sheet) {
+  const values = sheet.getRange(1, 1, Math.min(25, sheet.getMaxRows()), sheet.getMaxColumns()).getDisplayValues();
+  for (let r = 0; r < values.length; r += 1) {
+    const headers = {};
+    values[r].forEach((value, index) => {
+      const key = normaliseerKop_(value);
+      if (key) headers[key] = index + 1;
+    });
+    if (headers.rang && headers.discordid) {
+      return { headers, firstRow: r + 2, lastRow: sheet.getLastRow() };
+    }
+  }
+  throw new Error("Koppen niet gevonden tijdens setup.");
+}
+
+function toegestaneWaarden_(cell) {
+  const rule = cell.getDataValidation();
+  if (!rule) return null;
+  const type = rule.getCriteriaType();
+  const args = rule.getCriteriaValues();
+  if (type === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) return args[0].map(String);
+  if (type === SpreadsheetApp.DataValidationCriteria.VALUE_IN_RANGE) return args[0].getDisplayValues().flat().filter(Boolean).map(String);
   return null;
 }
 
-function normalizeHeader_(value) {
-  return String(value || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "");
+function haalLogblad_(spreadsheet) {
+  let sheet = spreadsheet.getSheetByName(AFR_LOGBLAD);
+  if (!sheet) sheet = spreadsheet.insertSheet(AFR_LOGBLAD);
+  if (!sheet.getLastRow()) {
+    sheet.appendRow(["Datum en tijd", "Actie", "Discord ID", "Naam", "Uitgevoerd door", "Resultaat"]);
+    sheet.getRange(1, 1, 1, 6).setFontWeight("bold").setBackground("#0F172A").setFontColor("#FFFFFF");
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
 }
 
-function normalizeDiscordId_(value) {
+function schrijfLog_(spreadsheet, type, data, result) {
+  const actor = [data.actorName, data.actorId ? `(${data.actorId})` : ""].filter(Boolean).join(" ");
+  haalLogblad_(spreadsheet).appendRow([
+    new Date(), type, String(data.discordId || ""), String(data.name || ""), actor,
+    result && result.message ? result.message : JSON.stringify(result || {}),
+  ]);
+}
+
+function parseDatum_(value) {
+  if (!value) return new Date();
+  const text = String(value);
+  const dutch = text.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
+  if (dutch) return new Date(Number(dutch[3]), Number(dutch[2]) - 1, Number(dutch[1]));
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) throw new Error("Ongeldige datum. Gebruik DD-MM-JJJJ.");
+  return parsed;
+}
+
+function normaliseerKop_(value) {
+  return String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function normaliseerTekst_(value) {
+  return String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/\bafr\b/g, " ").replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function normaliseerDiscordId_(value) {
   const match = String(value || "").match(/\d{17,20}/);
   return match ? match[0] : "";
 }
 
-function normalizeText_(value) {
-  return String(value || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/\bafr\b/g, " ")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-}
-
-function roleMatchScore_(sheetRank, discordRank) {
-  const left = normalizeText_(sheetRank);
-  const right = normalizeText_(discordRank);
-
+function rangScore_(leftValue, rightValue) {
+  const left = normaliseerTekst_(leftValue);
+  const right = normaliseerTekst_(rightValue);
   if (!left || !right) return 0;
-  if (left === right) return 100;
-  if (left.replace(/\s+/g, "") === right.replace(/\s+/g, "")) return 95;
-  if (left.includes(right) || right.includes(left)) return 90;
-
-  const leftWords = new Set(left.split(/\s+/));
-  const rightWords = new Set(right.split(/\s+/));
-  const common = [...leftWords].filter((word) => rightWords.has(word)).length;
-  return common / Math.max(leftWords.size, rightWords.size);
+  if (left === right) return 1;
+  if (left.replace(/\s/g, "") === right.replace(/\s/g, "")) return 0.95;
+  if (left.includes(right) || right.includes(left)) return 0.85;
+  return 0;
 }
 
-function findMemberRow_(context, discordId) {
-  const idColumn = context.headers.discordid;
-  const rowCount = Math.max(0, context.lastDataRow - context.firstDataRow + 1);
-
-  if (!discordId || !rowCount) return null;
-
-  const values = context.sheet
-    .getRange(context.firstDataRow, idColumn, rowCount, 1)
-    .getDisplayValues();
-  const wantedId = normalizeDiscordId_(discordId);
-  const index = values.findIndex(
-    ([value]) => normalizeDiscordId_(value) === wantedId,
-  );
-
-  return index < 0 ? null : context.firstDataRow + index;
-}
-
-function findEmptyRankRow_(context, rankName) {
-  const rowCount = Math.max(0, context.lastDataRow - context.firstDataRow + 1);
-
-  if (!rankName || !rowCount) {
-    throw new Error("Nieuwe Discord-rang ontbreekt.");
+function verplicht_(value, label) {
+  if (value === null || value === undefined || String(value).trim() === "") {
+    throw new Error(`${label} ontbreekt.`);
   }
-
-  const ranks = context.sheet
-    .getRange(context.firstDataRow, context.headers.rang, rowCount, 1)
-    .getDisplayValues();
-  const ids = context.sheet
-    .getRange(context.firstDataRow, context.headers.discordid, rowCount, 1)
-    .getDisplayValues();
-  const candidates = ranks
-    .map(([rank], index) => ({
-      row: context.firstDataRow + index,
-      rank,
-      score: roleMatchScore_(rank, rankName),
-      empty: !normalizeDiscordId_(ids[index][0]),
-    }))
-    .filter((candidate) => candidate.empty && candidate.score >= 0.6)
-    .sort((a, b) => b.score - a.score || a.row - b.row);
-
-  if (!candidates.length) {
-    throw new Error(`Geen lege, passende rij gevonden voor rang '${rankName}'.`);
-  }
-
-  return candidates[0].row;
 }
 
-function getAllowedValues_(cell) {
-  const rule = cell.getDataValidation();
-
-  if (!rule) return null;
-
-  const type = rule.getCriteriaType();
-  const args = rule.getCriteriaValues();
-
-  if (type === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) {
-    return args[0].map(String);
-  }
-
-  if (type === SpreadsheetApp.DataValidationCriteria.VALUE_IN_RANGE) {
-    return args[0].getDisplayValues().flat().filter(Boolean).map(String);
-  }
-
-  return null;
-}
-
-function selectAllowedValue_(cell, wantedValues, fallbackToEmpty) {
-  const wanted = (Array.isArray(wantedValues) ? wantedValues : [wantedValues])
-    .filter((value) => value !== null && value !== undefined && value !== "");
-  const allowed = getAllowedValues_(cell);
-
-  if (!allowed) {
-    if (wanted.length) cell.setValue(wanted[0]);
-    else if (fallbackToEmpty) cell.clearContent();
-    return wanted[0] || "";
-  }
-
-  let best = null;
-  let bestScore = 0;
-
-  for (const option of allowed) {
-    for (const value of wanted) {
-      const score = roleMatchScore_(option, value);
-      if (score > bestScore) {
-        best = option;
-        bestScore = score;
-      }
-    }
-  }
-
-  if (best && bestScore >= 0.6) {
-    cell.setValue(best);
-    return best;
-  }
-
-  const neutral = allowed.find((option) =>
-    ["nvt", "niet van toepassing", "geen"].includes(normalizeHeader_(option)),
-  );
-
-  if (neutral) {
-    cell.setValue(neutral);
-    return neutral;
-  }
-
-  if (fallbackToEmpty) cell.clearContent();
-  return "";
-}
-
-function setColumnValue_(context, row, headerName, value, validated) {
-  const column = context.headers[normalizeHeader_(headerName)];
-  if (!column) return false;
-
-  return setColumnNumberValue_(context, row, column, value, validated);
-}
-
-function setColumnNumberValue_(
-  context,
-  row,
-  column,
-  value,
-  validated,
-  overwriteFormula,
-) {
-  const cell = context.sheet.getRange(row, column);
-  if (cell.getFormula()) {
-    if (!overwriteFormula) return false;
-    cell.clearContent();
-  }
-
-  if (validated) selectAllowedValue_(cell, value, false);
-  else cell.setValue(value);
-  return true;
-}
-
-function clearColumnNumberValue_(context, row, column) {
-  const cell = context.sheet.getRange(row, column);
-  if (cell.getFormula()) return false;
-
-  cell.clearContent();
-  return true;
-}
-
-function parseDutchDate_(value) {
-  const match = String(value || "").match(/(\d{1,2})[-/](\d{1,2})[-/](\d{4})/);
-  if (!match) return new Date();
-  return new Date(Number(match[3]), Number(match[2]) - 1, Number(match[1]));
-}
-
-function getStaffRankCandidates_(data) {
-  const requestedRank = normalizeText_(data.staffRankName);
-  const canonicalRank = AFR_STAFF_RANKS.find(
-    (rankName) => normalizeText_(rankName) === requestedRank,
-  );
-
-  return [canonicalRank, data.staffRankName, data.staffRankId];
-}
-
-function moveMemberRow_(context, sourceRow, destinationRow) {
-  if (!sourceRow || sourceRow === destinationRow) return;
-
-  const protectedHeaders = new Set(["rang"]);
-
-  Object.entries(context.headers).forEach(([header, column]) => {
-    if (protectedHeaders.has(header)) return;
-
-    const sourceCell = context.sheet.getRange(sourceRow, column);
-    const destinationCell = context.sheet.getRange(destinationRow, column);
-
-    if (!destinationCell.getFormula()) {
-      const sourceValue = sourceCell.getValue();
-      const allowed = getAllowedValues_(destinationCell);
-
-      if (allowed) selectAllowedValue_(destinationCell, sourceValue, true);
-      else destinationCell.setValue(sourceValue);
-    }
-  });
-
-  clearMemberRow_(context, sourceRow);
-}
-
-function clearMemberRow_(context, row) {
-  Object.entries(context.headers).forEach(([header, column]) => {
-    if (header === "rang") return;
-
-    const cell = context.sheet.getRange(row, column);
-    if (cell.getFormula()) return;
-
-    const rule = cell.getDataValidation();
-    const criteria = rule ? rule.getCriteriaType() : null;
-
-    if (criteria === SpreadsheetApp.DataValidationCriteria.CHECKBOX) {
-      cell.setValue(false);
-    } else if (getAllowedValues_(cell)) {
-      selectAllowedValue_(cell, ["N.V.T", "Geen"], true);
-    } else {
-      cell.clearContent();
-    }
-  });
-}
-
-function resetVacantMemberRow_(context, row) {
-  clearMemberRow_(context, row);
-  setColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.name,
-    "[AFR]",
-    false,
-  );
-  setColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.discordId,
-    "<@>",
-    false,
-  );
-  setColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.status,
-    ["N.V.T.", "N.V.T", "NVT"],
-    true,
-  );
-  clearColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.acceptedDate,
-  );
-  clearColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.lastChanged,
-  );
-  setColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.changedBy,
-    ["N.V.T.", "N.V.T", "NVT"],
-    true,
-    true,
-  );
-  setColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.acceptedBy,
-    ["N.V.T.", "N.V.T", "NVT"],
-    true,
-    true,
-  );
-  setColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.staffRank,
-    ["N.V.T.", "N.V.T", "NVT"],
-    true,
-    true,
-  );
-}
-
-function getRankBlockEnd_(context, row) {
-  const rankColumn = context.headers.rang;
-  const rankName = context.sheet.getRange(row, rankColumn).getDisplayValue();
-  const normalizedRank = normalizeText_(rankName);
-  let endRow = row;
-
-  for (
-    let candidateRow = row + 1;
-    candidateRow <= context.lastDataRow;
-    candidateRow += 1
-  ) {
-    const candidateRank = context.sheet
-      .getRange(candidateRow, rankColumn)
-      .getDisplayValue();
-
-    if (normalizeText_(candidateRank) !== normalizedRank) break;
-    endRow = candidateRow;
-  }
-
-  return endRow;
-}
-
-function ensureMemberAtRank_(context, data) {
-  const sourceRow = findMemberRow_(context, data.discordId);
-  const destinationRow = findEmptyRankRow_(context, data.newRankName || data.rankName);
-
-  moveMemberRow_(context, sourceRow, destinationRow);
-  setColumnValue_(context, destinationRow, "Naam", data.name || "Onbekend", false);
-  setColumnValue_(context, destinationRow, "Discord ID", `<@${data.discordId}>`, false);
-  return destinationRow;
-}
-
-function applyAccepted_(context, data) {
-  let row = findMemberRow_(context, data.discordId);
-
-  if (!row) {
-    row = ensureMemberAtRank_(context, data);
-  }
-
-  setColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.name,
-    data.name || "Onbekend",
-    false,
-  );
-  setColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.discordId,
-    `<@${data.discordId}>`,
-    false,
-  );
-  setColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.status,
-    ["Actief", "Active"],
-    true,
-  );
-  const acceptedAt = parseDutchDate_(data.acceptedDate);
-
-  setColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.acceptedDate,
-    acceptedAt,
-    false,
-  );
-  setColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.lastChanged,
-    acceptedAt,
-    false,
-  );
-  setColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.changedBy,
-    ["Automatisch Systeem", "Automatische Systeem"],
-    true,
-    true,
-  );
-  setColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.acceptedBy,
-    [data.acceptedByName, data.acceptedById],
-    true,
-    true,
-  );
-  setColumnNumberValue_(
-    context,
-    row,
-    AFR_ACCEPTED_COLUMNS.staffRank,
-    getStaffRankCandidates_(data),
-    true,
-    true,
-  );
-  return {
-    message: `Aangenomen persoon bijgewerkt op rij ${row}.`,
-    row,
-    changedBy: context.sheet
-      .getRange(row, AFR_ACCEPTED_COLUMNS.changedBy)
-      .getDisplayValue(),
-    acceptedBy: context.sheet
-      .getRange(row, AFR_ACCEPTED_COLUMNS.acceptedBy)
-      .getDisplayValue(),
-    staffRank: context.sheet
-      .getRange(row, AFR_ACCEPTED_COLUMNS.staffRank)
-      .getDisplayValue(),
-  };
-}
-
-function applyRankChange_(context, data) {
-  const row = ensureMemberAtRank_(context, data);
-  const changedAt = data.occurredAt ? new Date(data.occurredAt) : new Date();
-
-  setColumnValue_(context, row, "Status", ["Actief", "Active"], true);
-  setColumnValue_(context, row, "Laatste Wijziging", changedAt, false);
-  setColumnValue_(
-    context,
-    row,
-    "Gewijzigd door",
-    [data.actorName, data.actorId],
-    true,
-  );
-  return `Rang gewijzigd naar '${data.newRankName}' op rij ${row}.`;
-}
-
-function applyWarning_(context, data) {
-  const row = findMemberRow_(context, data.discordId);
-  if (!row) throw new Error(`Discord-ID ${data.discordId} staat niet in het tabblad.`);
-
-  const warningColumn = context.headers.waarschuwingen;
-  if (!warningColumn) throw new Error("Kolom Waarschuwingen niet gevonden.");
-
-  const cell = context.sheet.getRange(row, warningColumn);
-  const current = cell.getDisplayValue();
-  const currentNumberMatch = current.match(/\d+/);
-  const currentNumber = Number(currentNumberMatch ? currentNumberMatch[0] : 0);
-  const nextNumber = currentNumber + 1;
-
-  selectAllowedValue_(
-    cell,
-    [`Waarschuwing ${nextNumber}`, String(nextNumber)],
-    false,
-  );
-  setColumnValue_(context, row, "Laatste Wijziging", new Date(), false);
-  setColumnValue_(
-    context,
-    row,
-    "Gewijzigd door",
-    [data.actorName, data.actorId],
-    true,
-  );
-  return `Waarschuwing ${nextNumber} bijgewerkt op rij ${row}.`;
-}
-
-function applyWarningRemoval_(context, data) {
-  const row = findMemberRow_(context, data.discordId);
-  if (!row) throw new Error(`Discord-ID ${data.discordId} staat niet in het tabblad.`);
-
-  const warningColumn = context.headers.waarschuwingen;
-  if (!warningColumn) throw new Error("Kolom Waarschuwingen niet gevonden.");
-
-  const cell = context.sheet.getRange(row, warningColumn);
-  const current = cell.getDisplayValue();
-  const currentNumberMatch = current.match(/\d+/);
-  const currentNumber = Number(currentNumberMatch ? currentNumberMatch[0] : 0);
-
-  if (currentNumber <= 0) {
-    throw new Error(`Discord-ID ${data.discordId} heeft geen waarschuwing in de spreadsheet.`);
-  }
-
-  const nextNumber = currentNumber - 1;
-  const wantedValues = nextNumber > 0
-    ? [`Waarschuwing ${nextNumber}`, String(nextNumber)]
-    : ["N.V.T", "Niet van toepassing", "Geen", "0"];
-
-  selectAllowedValue_(cell, wantedValues, nextNumber === 0);
-  setColumnValue_(context, row, "Laatste Wijziging", new Date(), false);
-  setColumnValue_(
-    context,
-    row,
-    "Gewijzigd door",
-    [data.actorName, data.actorId],
-    true,
-  );
-
-  return nextNumber > 0
-    ? `Waarschuwing verlaagd naar ${nextNumber} op rij ${row}.`
-    : `Laatste waarschuwing verwijderd op rij ${row}; waarde teruggezet naar N.V.T.`;
-}
-
-function applyTermination_(context, data) {
-  if (!data.discordId) {
-    return "Geen Discord-ID; er is geen bestaande rij leeggemaakt.";
-  }
-
-  const row = findMemberRow_(context, data.discordId);
-  if (!row) return `Discord-ID ${data.discordId} stond niet in het tabblad.`;
-
-  const rankBlockEnd = getRankBlockEnd_(context, row);
-  let destinationRow = row;
-
-  for (
-    let sourceRow = row + 1;
-    sourceRow <= rankBlockEnd;
-    sourceRow += 1
-  ) {
-    const sourceDiscordId = normalizeDiscordId_(
-      context.sheet
-        .getRange(sourceRow, context.headers.discordid)
-        .getDisplayValue(),
-    );
-
-    if (!sourceDiscordId) continue;
-
-    moveMemberRow_(context, sourceRow, destinationRow);
-    destinationRow += 1;
-  }
-
-  resetVacantMemberRow_(context, destinationRow);
-  return `Ontslagen persoon verwijderd; lege regel staat onderaan het rangblok op rij ${destinationRow}.`;
-}
-
-function applyDeparture_(context, data, preferredStatus) {
-  if (!data.discordId) return "Geen Discord-ID; er is geen bestaande rij aangepast.";
-
-  const row = findMemberRow_(context, data.discordId);
-  if (!row) return `Discord-ID ${data.discordId} stond niet in het tabblad.`;
-
-  setColumnValue_(
-    context,
-    row,
-    "Status",
-    [preferredStatus, "Inactief", "Niet actief"],
-    true,
-  );
-  setColumnValue_(context, row, "Laatste Wijziging", new Date(), false);
-  setColumnValue_(
-    context,
-    row,
-    "Gewijzigd door",
-    [data.actorName, data.actorId],
-    true,
-  );
-  return `${preferredStatus} bijgewerkt op rij ${row}.`;
-}
-
-function jsonResponse_(payload) {
-  return ContentService.createTextOutput(JSON.stringify(payload)).setMimeType(
-    ContentService.MimeType.JSON,
-  );
+function json_(payload) {
+  return ContentService.createTextOutput(JSON.stringify(payload))
+    .setMimeType(ContentService.MimeType.JSON);
 }
