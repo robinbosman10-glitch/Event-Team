@@ -102,20 +102,20 @@ function maakAangenomenEmbed(member, data, interaction, bestaand = false) {
       name: 'AFR Event Team',
       iconURL: interaction.guild?.iconURL({ size: 256 }) || undefined,
     })
-    .setTitle(bestaand ? 'ð Event Team-lid!' : 'ð Nieuw Event Team-lid aangenomen!')
+    .setTitle(bestaand ? '\u{1F389} Event Team-lid!' : '\u{1F389} Nieuw Event Team-lid aangenomen!')
     .setDescription(
       `Van harte welkom ${mention} bij het **AFR Event Team**!\n` +
-      'We wensen je veel succes en vooral veel plezier binnen het team. ð',
+      'We wensen je veel succes en vooral veel plezier binnen het team. \u{1F49A}',
     )
     .addFields(
-      { name: 'ð¤ Naam', value: data.name, inline: true },
-      { name: 'ð·ï¸ Rang', value: data.rank, inline: true },
-      { name: 'ð¢ Status', value: data.status, inline: true },
-      { name: 'ð Aangenomen op', value: data.acceptedDate, inline: true },
-      { name: 'ð¤ Aangenomen door', value: data.acceptedBy, inline: true },
-      { name: 'ð Discord ID', value: data.discordId || member?.id || 'Onbekend', inline: true },
+      { name: '\u{1F464} Naam', value: data.name, inline: true },
+      { name: '\u{1F3F7}\uFE0F Rang', value: data.rank, inline: true },
+      { name: '\u{1F7E2} Status', value: data.status, inline: true },
+      { name: '\u{1F4C5} Aangenomen op', value: data.acceptedDate, inline: true },
+      { name: '\u{1F91D} Aangenomen door', value: data.acceptedBy, inline: true },
+      { name: '\u{1F194} Discord ID', value: data.discordId || member?.id || 'Onbekend', inline: true },
     )
-    .setFooter({ text: `AFR Event Team â¢ Welkom ${data.name}!` })
+    .setFooter({ text: `AFR Event Team \u2022 Welkom ${data.name}!` })
     .setTimestamp();
 
   if (member) embed.setThumbnail(member.displayAvatarURL({ size: 256 }));
@@ -197,10 +197,10 @@ async function handleAfrSpreadsheetCommand(interaction) {
   if (interaction.commandName === 'aangenomeninhalen') {
     try {
       const geplaatst = await haalBestaandeAangenomenMeldingenIn(interaction);
-      await interaction.editReply(`â Voor ${geplaatst} bestaande leden is apart een welkomstmelding geplaatst.`);
+      await interaction.editReply(`\u2705 Voor ${geplaatst} bestaande leden is apart een welkomstmelding geplaatst.`);
     } catch (error) {
       console.error('Bestaande aangenomen-meldingen inhalen mislukt:', error);
-      await interaction.editReply(`â ${error.message}`);
+      await interaction.editReply(`\u274C ${error.message}`);
     }
     return true;
   }
@@ -267,24 +267,24 @@ async function handleAfrSpreadsheetCommand(interaction) {
         });
         if (spreadsheetError) {
           await interaction.editReply(
-            `â De welkomstmelding is in dit kanaal geplaatst.\nâ ï¸ Google Sheets kon na 3 pogingen niet worden bijgewerkt: ${spreadsheetError.message}`,
+            `\u2705 De welkomstmelding is in dit kanaal geplaatst.\n\u26A0\uFE0F Google Sheets kon na 3 pogingen niet worden bijgewerkt: ${spreadsheetError.message}`,
           );
         } else {
-          await interaction.editReply(`â ${result.message}\nâ De welkomstmelding is in dit kanaal geplaatst.`);
+          await interaction.editReply(`\u2705 ${result.message}\n\u2705 De welkomstmelding is in dit kanaal geplaatst.`);
         }
       } catch (announcementError) {
         console.warn('Welkomstmelding kon niet worden geplaatst:', announcementError);
         const sheetStatus = spreadsheetError
-          ? `â ï¸ Google Sheets is niet bijgewerkt: ${spreadsheetError.message}`
-          : `â ${result.message}`;
-        await interaction.editReply(`${sheetStatus}\nâ ï¸ De welkomstmelding kon niet worden geplaatst. Controleer mijn berichtrechten.`);
+          ? `\u26A0\uFE0F Google Sheets is niet bijgewerkt: ${spreadsheetError.message}`
+          : `\u2705 ${result.message}`;
+        await interaction.editReply(`${sheetStatus}\n\u26A0\uFE0F De welkomstmelding kon niet worden geplaatst. Controleer mijn berichtrechten.`);
       }
     } else {
-      await interaction.editReply(`â ${result.message}`);
+      await interaction.editReply(`\u2705 ${result.message}`);
     }
   } catch (error) {
     console.error('AFR spreadsheetactie mislukt:', error);
-    await interaction.editReply(`â ${error.message}`);
+    await interaction.editReply(`\u274C ${error.message}`);
   }
   return true;
 }
