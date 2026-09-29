@@ -2,6 +2,7 @@ const {
   SlashCommandBuilder,
   PermissionFlagsBits,
   MessageFlags,
+  EmbedBuilder,
 } = require('discord.js');
 
 const RANKS = [
@@ -78,6 +79,42 @@ function datumVandaag() {
   return `${get('day')}-${get('month')}-${get('year')}`;
 }
 
+function rangKleur(rank) {
+  if (rank === 'Event Leider') return 0xFFD700;
+  if (rank === 'Hoofd Leiding') return 0xFF1493;
+  if (rank === 'Assistent Hoofd Leiding') return 0xFF4FB3;
+  if (rank === 'Leiding') return 0x3498DB;
+  if (rank === 'Assistent Leiding') return 0x74C0FC;
+  if (rank === 'Proef Leiding') return 0xFF8C00;
+  if (rank.includes('Event Host')) return 0x238636;
+  return 0x57D68D;
+}
+
+function maakAangenomenEmbed(member, data, interaction) {
+  return new EmbedBuilder()
+    .setColor(rangKleur(data.rank))
+    .setAuthor({
+      name: 'AFR Event Team',
+      iconURL: interaction.guild?.iconURL({ size: 256 }) || undefined,
+    })
+    .setTitle('🎉 Nieuw Event Team-lid aangenomen!')
+    .setDescription(
+      `Van harte welkom ${member} bij het **AFR Event Team**!\n` +
+      'We wensen je veel succes en vooral veel plezier binnen het team. 💚',
+    )
+    .addFields(
+      { name: '👤 Naam', value: data.name, inline: true },
+      { name: '🏷️ Rang', value: data.rank, inline: true },
+      { name: '🟢 Status', value: data.status, inline: true },
+      { name: '📅 Aangenomen op', value: data.acceptedDate, inline: true },
+      { name: '🤝 Aangenomen door', value: data.acceptedBy, inline: true },
+      { name: '🆔 Discord ID', value: member.id, inline: true },
+    )
+    .setThumbnail(member.displayAvatarURL({ size: 256 }))
+    .setFooter({ text: `AFR Event Team • Welkom ${data.name}!` })
+    .setTimestamp();
+}
+
 async function stuurNaarSpreadsheet(type, data) {
   const url = process.env.SHEET_WEBHOOK_URL;
   const secret = process.env.SHEET_WEBHOOK_SECRET;
@@ -144,7 +181,27 @@ async function handleAfrSpreadsheetCommand(interaction) {
     }
 
     const result = await stuurNaarSpreadsheet(type, data);
-    await interaction.editReply(`✅ ${result.message}`);
+
+    if (interaction.commandName === 'aangenomen') {
+      try {
+        if (!interaction.channel?.isTextBased()) {
+          throw new Error('Dit kanaal ondersteunt geen berichten.');
+        }
+        await interaction.channel.send({
+          content: `${member}`,
+          embeds: [maakAangenomenEmbed(member, data, interaction)],
+          allowedMentions: { users: [member.id] },
+        });
+        await interaction.editReply(`✅ ${result.message}\n✅ De welkomstmelding is in dit kanaal geplaatst.`);
+      } catch (announcementError) {
+        console.warn('Welkomstmelding kon niet worden geplaatst:', announcementError);
+        await interaction.editReply(
+          `✅ ${result.message}\n⚠️ De spreadsheet is bijgewerkt, maar ik kon de welkomstmelding niet in dit kanaal plaatsen. Controleer mijn berichtrechten.`,
+        );
+      }
+    } else {
+      await interaction.editReply(`✅ ${result.message}`);
+    }
   } catch (error) {
     console.error('AFR spreadsheetactie mislukt:', error);
     await interaction.editReply(`❌ ${error.message}`);
