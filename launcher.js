@@ -168,7 +168,7 @@ replaceRequired(
   } catch (error) {
     console.error(
       "Openstaande afwezigheidstemplates konden niet worden omgezet:",
-      erroq,
+      error,
     );
   }`,
   `  console.log("Oude afwezigheidstemplate is uitgeschakeld.");`,
