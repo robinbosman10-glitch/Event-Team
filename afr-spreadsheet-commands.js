@@ -122,6 +122,16 @@ function maakAangenomenEmbed(member, data, interaction, bestaand = false) {
   return embed;
 }
 
+async function plaatsOpenbareMelding(interaction, payload) {
+  try {
+    return await interaction.followUp(payload);
+  } catch (followUpError) {
+    console.warn('Openbare interaction-follow-up mislukt, kanaalverzending wordt geprobeerd:', followUpError);
+    if (!interaction.channel?.isTextBased()) throw followUpError;
+    return interaction.channel.send(payload);
+  }
+}
+
 async function haalBestaandeAangenomenMeldingenIn(interaction) {
   const result = await stuurNaarSpreadsheet('members', {
     actorId: interaction.user.id,
@@ -129,12 +139,11 @@ async function haalBestaandeAangenomenMeldingenIn(interaction) {
   });
   const members = Array.isArray(result?.members) ? result.members : [];
   if (!members.length) throw new Error('Er staan geen ingevulde leden in de spreadsheet.');
-  if (!interaction.channel?.isTextBased()) throw new Error('Dit kanaal ondersteunt geen berichten.');
 
   let geplaatst = 0;
   for (const data of members) {
     const member = await interaction.client.users.fetch(data.discordId).catch(() => null);
-    await interaction.channel.send({
+    await plaatsOpenbareMelding(interaction, {
       content: `<@${data.discordId}>`,
       embeds: [maakAangenomenEmbed(member, data, interaction, true)],
       allowedMentions: { users: [data.discordId] },
@@ -245,43 +254,46 @@ async function handleAfrSpreadsheetCommand(interaction) {
       type = 'terminated';
     }
 
-    let result = null;
-    let spreadsheetError = null;
-    try {
-      result = await stuurNaarSpreadsheet(type, data);
-    } catch (error) {
-      spreadsheetError = error;
-      if (interaction.commandName !== 'aangenomen') throw error;
-      console.warn('Aangenomen-melding wordt geplaatst ondanks spreadsheetfout:', error);
-    }
-
     if (interaction.commandName === 'aangenomen') {
+      let announcementError = null;
       try {
-        if (!interaction.channel?.isTextBased()) {
-          throw new Error('Dit kanaal ondersteunt geen berichten.');
-        }
-        await interaction.channel.send({
+        await plaatsOpenbareMelding(interaction, {
           content: `${member}`,
           embeds: [maakAangenomenEmbed(member, data, interaction)],
           allowedMentions: { users: [member.id] },
         });
-        if (spreadsheetError) {
-          await interaction.editReply(
-            `\u2705 De welkomstmelding is in dit kanaal geplaatst.\n\u26A0\uFE0F Google Sheets kon na 3 pogingen niet worden bijgewerkt: ${spreadsheetError.message}`,
-          );
-        } else {
-          await interaction.editReply(`\u2705 ${result.message}\n\u2705 De welkomstmelding is in dit kanaal geplaatst.`);
-        }
-      } catch (announcementError) {
-        console.warn('Welkomstmelding kon niet worden geplaatst:', announcementError);
+        await interaction.editReply('\u2705 De welkomstmelding is direct in dit kanaal geplaatst. Google Sheets wordt bijgewerkt...');
+      } catch (error) {
+        announcementError = error;
+        console.warn('Welkomstmelding kon niet worden geplaatst:', error);
+      }
+
+      let result = null;
+      let spreadsheetError = null;
+      try {
+        result = await stuurNaarSpreadsheet(type, data);
+      } catch (error) {
+        spreadsheetError = error;
+        console.warn('Google Sheets kon na de aangenomen-melding niet worden bijgewerkt:', error);
+      }
+
+      if (announcementError) {
         const sheetStatus = spreadsheetError
           ? `\u26A0\uFE0F Google Sheets is niet bijgewerkt: ${spreadsheetError.message}`
           : `\u2705 ${result.message}`;
-        await interaction.editReply(`${sheetStatus}\n\u26A0\uFE0F De welkomstmelding kon niet worden geplaatst. Controleer mijn berichtrechten.`);
+        await interaction.editReply(`${sheetStatus}\n\u274C De welkomstmelding kon niet worden geplaatst. Controleer mijn berichtrechten.`);
+      } else if (spreadsheetError) {
+        await interaction.editReply(
+          `\u2705 De welkomstmelding is direct in dit kanaal geplaatst.\n\u26A0\uFE0F Google Sheets kon na 3 pogingen niet worden bijgewerkt: ${spreadsheetError.message}`,
+        );
+      } else {
+        await interaction.editReply(`\u2705 De welkomstmelding is direct in dit kanaal geplaatst.\n\u2705 ${result.message}`);
       }
-    } else {
-      await interaction.editReply(`\u2705 ${result.message}`);
+      return true;
     }
+
+    const result = await stuurNaarSpreadsheet(type, data);
+    await interaction.editReply(`\u2705 ${result.message}`);
   } catch (error) {
     console.error('AFR spreadsheetactie mislukt:', error);
     await interaction.editReply(`\u274C ${error.message}`);
