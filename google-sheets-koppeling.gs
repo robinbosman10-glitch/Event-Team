@@ -81,6 +81,8 @@ function verwerkActie_(type, data) {
         lastDataRow: context.lastRow,
         rows: context.lastRow - context.firstRow + 1,
       };
+    case "members":
+      return haalAlleLeden_(context);
     case "accepted":
       result = neemAan_(context, data);
       break;
@@ -105,6 +107,38 @@ function verwerkActie_(type, data) {
 
   schrijfLog_(context.spreadsheet, type, data, result);
   return result;
+}
+
+function haalAlleLeden_(context) {
+  const count = context.lastRow - context.firstRow + 1;
+  if (count < 1) return { members: [], count: 0, message: "Geen ingevulde leden gevonden." };
+
+  const width = context.sheet.getMaxColumns();
+  const displayValues = context.sheet
+    .getRange(context.firstRow, 1, count, width)
+    .getDisplayValues();
+
+  const waarde = (row, header) => {
+    const column = context.headers[normaliseerKop_(header)];
+    return column ? String(row[column - 1] || "").trim() : "";
+  };
+
+  const members = displayValues.map(row => ({
+    rank: waarde(row, "Rang"),
+    name: waarde(row, "Naam"),
+    discordId: normaliseerDiscordId_(waarde(row, "Discord ID")),
+    status: waarde(row, "Status") || "Actief",
+    acceptedDate: waarde(row, "Aangenomen op") || "Onbekend",
+    acceptedBy: waarde(row, "Aangenomen door") || "Onbekend",
+    warnings: waarde(row, "Waarschuwingen") || "Geen",
+    absent: waarde(row, "Afwezig") || "Nee",
+  })).filter(member => member.discordId && member.name);
+
+  return {
+    members,
+    count: members.length,
+    message: `${members.length} ingevulde leden opgehaald.`,
+  };
 }
 
 function haalContext_() {
